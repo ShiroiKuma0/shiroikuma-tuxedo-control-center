@@ -27,6 +27,7 @@ import type { TccProfile } from '../../common/models/TccProfile';
 import { NgTranslations, profileIdToI18nId } from '../NgTranslations';
 import { TccTray } from '../TccTray';
 import { UserConfig } from '../UserConfig';
+import { aquarisCleanUp, startAquarisLink } from './aquarisAPI';
 import type { BrightnessModeString } from './brightnessAPI';
 import { getBrightnessMode, setBrightnessMode } from './brightnessAPI';
 import { activateTccGui, createPrimeWindow, quitCurrentTccSession } from './browserWindowsAPI';
@@ -110,6 +111,13 @@ app.whenReady().then(async (): Promise<void> => {
     startDbusAndInit();
 });
 
+// Fork: while the GUI runs it owns the single Aquaris BLE link (heart-beating
+// owner.lock so the bundled keeper yields). Released on quit so the keeper
+// re-acquires; a crash leaves the lock to go stale and the keeper recovers.
+app.on('before-quit', (): void => {
+    void aquarisCleanUp();
+});
+
 function exitIfProcessExists(): void {
     if (applicationLock) {
         let singletonLock: string;
@@ -165,6 +173,11 @@ async function initTray(): Promise<void> {
     tray.state.isAutostartTrayInstalled = isAutostartTrayInstalled();
     tray.state.fnLockSupported = await fnLockSupported();
     tray.state.hasAquaris = await hasAquaris();
+    // Fork: take ownership of the Aquaris link for the GUI's lifetime (LED off by
+    // default via desired.json); the keeper yields while we hold owner.lock.
+    if (tray.state.hasAquaris) {
+        startAquarisLink();
+    }
     if (tray.state.fnLockSupported) {
         tray.state.fnLockStatus = await fnLockStatus();
     }

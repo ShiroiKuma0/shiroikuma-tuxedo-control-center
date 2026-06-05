@@ -210,7 +210,11 @@ export class AquarisControlComponent implements OnInit, AfterContentInit, OnDest
             this.chosenColorHex = this.rgbToHex(state.red, state.green, state.blue);
 
             this.ctrlFanToggle.setValue(state.fanOn);
-            this.ctrlFanDutyCycle.setValue(state.fanDutyCycle);
+            // Fork: the fan gauge/slider has no separate on/off toggle, so reflect "off"
+            // as 0% (rather than the stale last duty) when fanOn is false.
+            this.ctrlFanDutyCycle.setValue(state.fanOn ? state.fanDutyCycle : 0);
+            // Fork: master on/off button reflects whether anything is active.
+            this.deviceActive = !!(state.fanOn || state.ledOn);
 
             this.ctrlPumpToggle.setValue(state.pumpOn);
             this.ctrlPumpDutyCycle.setValue(state.pumpDutyCycle);
@@ -249,6 +253,12 @@ export class AquarisControlComponent implements OnInit, AfterContentInit, OnDest
 
         if (!this.isConnected && !this.isConnecting && !this.isDisconnecting) {
             await this.discoverUpdate();
+        } else if (this.isConnected && !this.isConnecting && !this.isDisconnecting) {
+            // Fork: keeper model — the desired state can change externally (tccaquaris
+            // CLI / keeper). Refresh the controls live so they don't go stale until a
+            // tab switch. setValue from a formControl does NOT fire the (input)/(change)
+            // DOM handlers, so this won't loop back into writes.
+            await this.updateState();
         }
     }
 
@@ -302,11 +312,11 @@ export class AquarisControlComponent implements OnInit, AfterContentInit, OnDest
     }
 
     public async sliderFanInput(fanSpeed: number): Promise<void> {
-        const fanToggle: boolean = this.ctrlFanToggle.value;
-
+        // Fork: the slider IS the fan control (no separate toggle in the UI). >0 turns the
+        // fan on at that speed; 0 turns it off. This keeps fanOn in sync with the slider.
         if (this.isConnected) {
             try {
-                if (fanToggle) {
+                if (fanSpeed > 0) {
                     await this.aquaris.writeFanMode(fanSpeed);
                 } else {
                     await this.aquaris.writeFanOff();
@@ -363,18 +373,27 @@ export class AquarisControlComponent implements OnInit, AfterContentInit, OnDest
 
     public isConnecting: boolean = false;
     public isConnected: boolean = false;
+    public deviceActive: boolean = false;
 
     public async connectionToggle(): Promise<void> {
-        if (this.isConnecting || this.isDisconnecting) {
-            return;
-        }
-
-        const deviceUUID: string = this.selectedDeviceUUID;
-
-        if (!this.isConnected) {
-            await this.buttonConnect(deviceUUID);
-        } else {
+        // Fork: master on/off toggle. "On" = cooling and/or LED active. Turning off idles
+        // the device dark (fan off + LED off); turning on resumes cooling at the last fan
+        // speed (LED is left as-is so it can stay dark).
+        if (this.deviceActive) {
             await this.buttonDisconnect();
+        } else {
+            await this.buttonTurnOn();
+        }
+    }
+
+    public async buttonTurnOn(): Promise<void> {
+        try {
+            const state: AquarisState = await this.aquaris.getState();
+            const duty: number = state && state.fanDutyCycle > 0 ? state.fanDutyCycle : 50;
+            await this.aquaris.writeFanMode(duty);
+            await this.updateState();
+        } catch (err: unknown) {
+            console.error(`aquaris-control: turn-on failed => ${err}`);
         }
     }
 
@@ -430,39 +449,18 @@ export class AquarisControlComponent implements OnInit, AfterContentInit, OnDest
     public isDisconnecting: boolean = false;
 
     public async buttonDisconnect(): Promise<void> {
-        const disconnectNoticeDisable: string = localStorage.getItem('disconnectNoticeDisable');
-        if (disconnectNoticeDisable === null || disconnectNoticeDisable === 'false') {
-            const askToClose: ConfirmDialogResult = await this.utils.confirmDialog({
-                title: $localize`:@@aqDialogDisconnectTitle:Do you want to disconnect your Aquaris?`,
-                description: $localize`:@@aqDialogDisconnectDescription:Please ensure to follow our instructions carefully in case you want to unplug your Aquaris from your TUXEDO.`,
-                linkLabel: $localize`:@@aqDialogDisconnectLinkLabel:Instructions`,
-                linkHref: $localize`:@@aqDialogDisconnectLinkHref:https\://www.tuxedocomputers.com/en/TUXEDO-Aquaris.tuxedo`,
-                buttonAbortLabel: $localize`:@@aqDialogButtonAbortLabel:Stay connected`,
-                buttonConfirmLabel: $localize`:@@aqDialogButtonConfirmLabel:Disconnect`,
-                checkboxNoBotherLabel: $localize`:@@aqDialogCheckboxNoBotherLabel:Don't ask again`,
-                showCheckboxNoBother: true,
-            });
-            if (askToClose.noBother) {
-                localStorage.setItem('disconnectNoticeDisable', 'true');
-            }
-            if (!askToClose.confirm) return;
-        }
-
-        this.isDisconnecting = true;
+        // Fork (keeper model): a real BLE disconnect would let the device firmware light
+        // its LED blue, defeating the whole point of the keeper. So "Disconnect" instead
+        // turns the device OFF-and-DARK — cooling off + LED off — while the keeper keeps
+        // holding the link (so the LED stays black, not blue). Equivalent to `tccaquaris off`.
         try {
-            await this.aquaris.saveState();
-            await this.aquaris.disconnect();
-            this.isConnected = await this.aquaris.isConnected();
-            this.selectedDeviceUUID = this.findDefaultSelectedDevice();
-            if (this.selectedDeviceUUID === undefined) {
-                this.ctrlDeviceList.reset();
-            } else {
-                this.ctrlDeviceList.setValue([this.selectedDeviceUUID]);
-            }
+            this.ctrlFanToggle.setValue(false);
+            this.ctrlLedToggle.setValue(false);
+            await this.aquaris.writeFanOff();
+            await this.aquaris.writeRGBOff();
+            await this.updateState();
         } catch (err: unknown) {
-            console.error(`aquaris-control: disconnect failed => ${err}`);
-        } finally {
-            this.isDisconnecting = false;
+            console.error(`aquaris-control: turn-off failed => ${err}`);
         }
     }
 

@@ -46,7 +46,10 @@ along with TUXEDO Control Center.  If not, see <https://www.gnu.org/licenses/>.
                 <mat-icon>edit</mat-icon>
             </button>
         </span>
-        <button type="button" mat-stroked-button (click)="connectionToggle()" *ngIf="isConnected && !isConnecting && !isDisconnecting" i18n="@@aqButtonDisconnectLabel">Disconnect</button>
+        <button type="button" mat-stroked-button (click)="connectionToggle()" *ngIf="isConnected && !isConnecting && !isDisconnecting">
+            <span *ngIf="deviceActive" i18n="@@aqButtonTurnOffLabel">Turn off</span>
+            <span *ngIf="!deviceActive" i18n="@@aqButtonTurnOnLabel">Turn on</span>
+        </button>
     </mat-card-title>
 
     <div class="aquaris-content">

@@ -24,6 +24,13 @@ systemctl daemon-reload
 systemctl enable tccd tccd-sleep
 systemctl restart tccd
 
+# Aquaris keeper — per-user service that holds the BLE link, keeps the LED dark,
+# and applies the desired LED/pump/fan state (yielding to the GUI while it runs).
+install -D -m 0644 ${DIST_DATA}/tccaquaris-keeper.service /usr/lib/systemd/user/tccaquaris-keeper.service || true
+systemctl --global enable tccaquaris-keeper.service || true
+# Run headless across logouts for the primary desktop user (this fork's owner).
+loginctl enable-linger shiroikuma || true
+
 # set up udev rules
 mv ${DIST_DATA}/99-webcam.rules /etc/udev/rules.d/99-webcam.rules
 udevadm control --reload-rules && udevadm trigger

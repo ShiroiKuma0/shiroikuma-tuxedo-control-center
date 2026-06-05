@@ -17,306 +17,147 @@
  * along with TUXEDO Control Center.  If not, see <https://www.gnu.org/licenses/>.
  */
 
+/**
+ * Fork: the Aquaris IPC handlers no longer drive BLE directly. Instead they
+ * edit the shared desired state at ~/.config/tccaquaris/desired.json, which is
+ * applied by whichever AquarisLink currently owns the connection — the GUI's own
+ * link (while running) or the bundled keeper (headless). This is what lets the
+ * GUI, the keeper and the `tccaquaris` CLI all coexist over a single BLE link,
+ * and keeps the LED off by default. See src/e-app/AquarisLink.ts.
+ */
+
+import * as fs from 'node:fs';
+import * as os from 'node:os';
+import * as path from 'node:path';
 import type { IpcMainInvokeEvent } from 'electron';
 import { ipcMain } from 'electron';
 import type { AquarisState } from '../../common/models/IAquarisAPI';
 import { AquarisAPIFunctions } from '../../common/models/IAquarisAPI';
-import type { DeviceInfo } from '../LCT21001';
-import { LCT21001, PumpVoltage, RGBState } from '../LCT21001';
-import { hasAquaris, userConfig } from './initMain';
+import { AquarisLink } from '../AquarisLink';
+import { DeviceInfo } from '../LCT21001';
+import { hasAquaris } from './initMain';
 
-let aquarisStateExpected: AquarisState;
-let aquarisStateCurrent: AquarisState;
+const AQ_MAC: string = process.env.AQ_MAC ?? 'EE:5E:11:D8:5A:B5';
 
-let aquarisIoProgress: boolean = false;
-let aquarisSearchProgress: boolean = false;
+const CFG_DIR: string = path.join(os.homedir(), '.config', 'tccaquaris');
+const DESIRED_FILE: string = path.join(CFG_DIR, 'desired.json');
+const STATUS_FILE: string = path.join(CFG_DIR, 'status.json');
 
-let aquarisHasBluetooth: boolean = true;
+const DEFAULT_DESIRED: AquarisState = {
+    deviceUUID: AQ_MAC,
+    red: 0,
+    green: 119,
+    blue: 255,
+    ledMode: 0,
+    fanDutyCycle: 50,
+    pumpDutyCycle: 60,
+    pumpVoltage: 3,
+    ledOn: false,
+    fanOn: false,
+    pumpOn: false,
+};
 
-let searchingTimeout: NodeJS.Timeout;
-const searchingDelayMs: number = 1000;
-let discoverTries: number = 0;
-const discoverMaxTries: number = 5;
-let interestTries: number = 0;
-const interestMaxTries = 8;
-let isSearching: boolean = false;
-
-async function updateDeviceState(
-    dev: LCT21001,
-    current: AquarisState,
-    next: AquarisState,
-    overrideCheck = false,
-): Promise<void> {
-    if (!aquarisIoProgress) {
-        try {
-            aquarisIoProgress = true;
-            let updatedSomething: boolean;
-            do {
-                let updateLed: boolean = false;
-                let updateFan: boolean = false;
-                let updatePump: boolean = false;
-
-                updateLed =
-                    overrideCheck ||
-                    current.red !== next.red ||
-                    current.green !== next.green ||
-                    current.blue !== next.blue ||
-                    current.ledMode !== next.ledMode ||
-                    current.ledOn !== next.ledOn;
-                if (updateLed) {
-                    current.red = next.red;
-                    current.green = next.green;
-                    current.blue = next.blue;
-                    current.ledMode = next.ledMode;
-                    current.ledOn = next.ledOn;
-                    if (next.deviceUUID !== 'demo') {
-                        if (next.ledOn) {
-                            await dev.writeRGB(next.red, next.green, next.blue, next.ledMode);
-                        } else {
-                            await dev.writeRGBOff();
-                        }
-                    }
-                }
-
-                updateFan = overrideCheck || current.fanDutyCycle !== next.fanDutyCycle || current.fanOn !== next.fanOn;
-                if (updateFan) {
-                    current.fanDutyCycle = next.fanDutyCycle;
-                    current.fanOn = next.fanOn;
-                    if (next.deviceUUID !== 'demo') {
-                        if (next.fanOn) {
-                            await dev.writeFanMode(next.fanDutyCycle);
-                        } else {
-                            await dev.writeFanOff();
-                        }
-                    }
-                }
-
-                updatePump =
-                    overrideCheck ||
-                    current.pumpDutyCycle !== next.pumpDutyCycle ||
-                    current.pumpVoltage !== next.pumpVoltage ||
-                    current.pumpOn !== next.pumpOn;
-                if (updatePump) {
-                    current.pumpDutyCycle = next.pumpDutyCycle;
-                    current.pumpVoltage = next.pumpVoltage;
-                    current.pumpOn = next.pumpOn;
-                    if (next.deviceUUID !== 'demo') {
-                        if (next.pumpOn) {
-                            await dev.writePumpMode(next.pumpDutyCycle, next.pumpVoltage);
-                        } else {
-                            await dev.writePumpOff();
-                        }
-                    }
-                }
-                overrideCheck = false;
-                updatedSomething = updateLed || updateFan || updatePump;
-            } while (updatedSomething);
-            aquarisIoProgress = false;
-        } catch (err: unknown) {
-            console.error(`aquarisAPI: updateDeviceState failed => ${err}`);
-        } finally {
-            aquarisIoProgress = false;
-        }
-    }
-}
-async function doSearch(): Promise<void> {
-    aquarisSearchProgress = true;
+function readDesired(): AquarisState {
     try {
-        isSearching = true;
-        // Start discover if not started or restart if reached discover max tries
-        if (!(await aquaris.isDiscovering()) || discoverTries >= discoverMaxTries) {
-            discoverTries = 0;
-            await aquaris.stopDiscover();
-            aquarisHasBluetooth = await aquaris.startDiscover();
-            if (!aquarisHasBluetooth) {
-                aquarisSearchProgress = false;
-                await stopSearch();
-                return;
-            }
-            // Wait a moment after reconnect for initial discovery to have a chance
-            await new Promise<void>((resolve: () => void): NodeJS.Timeout => setTimeout(resolve, 500));
-        } else {
-            discoverTries += 1;
-        }
-
-        // Look for devices
-        devicesList = await aquaris.getDeviceList();
-
-        // Trigger another search if not timed out
-        if (interestTries < interestMaxTries) {
-            interestTries += 1;
-            searchingTimeout = setTimeout(doSearch, searchingDelayMs);
-        } else {
-            aquarisSearchProgress = false;
-            await stopSearch();
-        }
-    } finally {
-        aquarisSearchProgress = false;
+        const parsed = JSON.parse(fs.readFileSync(DESIRED_FILE, 'utf8')) as Partial<AquarisState>;
+        return { ...DEFAULT_DESIRED, ...parsed, deviceUUID: AQ_MAC };
+    } catch (_e: unknown) {
+        return { ...DEFAULT_DESIRED };
     }
 }
 
-async function startSearch(): Promise<void> {
-    if (!isSearching) {
-        await doSearch();
+function writeDesired(state: AquarisState): void {
+    try {
+        fs.mkdirSync(CFG_DIR, { recursive: true });
+        const tmp: string = `${DESIRED_FILE}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+        fs.renameSync(tmp, DESIRED_FILE);
+    } catch (err: unknown) {
+        console.error(`aquarisAPI: writeDesired failed => ${err}`);
     }
-    interestTries = 0;
 }
 
-async function stopSearch(): Promise<void> {
-    while (aquarisSearchProgress)
-        await new Promise<void>((resolve: () => void): NodeJS.Timeout => setTimeout(resolve, 100));
-    devicesList = [];
-    isSearching = false;
-    clearTimeout(searchingTimeout);
-    searchingTimeout = undefined;
-    interestTries = 0;
-    discoverTries = discoverMaxTries;
+function patchDesired(patch: Partial<AquarisState>): void {
+    writeDesired({ ...readDesired(), ...patch });
+}
+
+function statusConnected(): boolean {
+    try {
+        const s = JSON.parse(fs.readFileSync(STATUS_FILE, 'utf8')) as { connected?: boolean };
+        return s.connected === true;
+    } catch (_e: unknown) {
+        return false;
+    }
+}
+
+// The GUI owns the Aquaris BLE link for its whole lifetime (started from initMain
+// once the device is known). It heart-beats owner.lock so the bundled keeper
+// yields; on quit we stop it so the keeper re-acquires.
+let aquarisLink: AquarisLink | undefined;
+
+export function startAquarisLink(): void {
+    if (aquarisLink === undefined) {
+        aquarisLink = new AquarisLink('gui');
+        aquarisLink.start();
+    }
 }
 
 export async function aquarisCleanUp(): Promise<void> {
-    if (aquaris !== undefined) {
-        await aquaris.disconnect();
-        await stopSearch();
-        await aquaris.stopDiscover();
+    if (aquarisLink !== undefined) {
+        const link: AquarisLink = aquarisLink;
+        aquarisLink = undefined;
+        await link.stop();
     }
 }
 
-async function aquarisConnectedDemo(): Promise<boolean> {
-    return aquarisStateCurrent !== undefined && aquarisStateCurrent.deviceUUID === 'demo';
-}
-
-let devicesList: DeviceInfo[] = [];
-const aquaris = new LCT21001();
-
 export const aquarisHandlers: Map<string, (...args: any[]) => any> = new Map<string, (...args: any[]) => any>()
-    .set(AquarisAPIFunctions.connect, async (deviceUUID: string): Promise<void> => {
-        try {
-            await stopSearch();
-
-            if (deviceUUID === 'demo') {
-                await new Promise<void>((resolve: () => void): NodeJS.Timeout => setTimeout(resolve, 600));
-            } else {
-                await aquaris.connect(deviceUUID);
-            }
-
-            aquarisStateCurrent = {
-                deviceUUID: deviceUUID,
-                red: 255,
-                green: 0,
-                blue: 0,
-                ledMode: RGBState.Static,
-                fanDutyCycle: 50,
-                pumpDutyCycle: 60,
-                pumpVoltage: PumpVoltage.V8,
-                ledOn: true,
-                fanOn: true,
-                pumpOn: true,
-            };
-            const aquarisSavedSerialized: string = await userConfig.get('aquarisSaveState');
-            if (aquarisSavedSerialized !== undefined) {
-                aquarisStateExpected = JSON.parse(aquarisSavedSerialized) as AquarisState;
-            } else {
-                aquarisStateExpected = Object.assign({}, aquarisStateCurrent);
-            }
-            aquarisStateExpected.deviceUUID = deviceUUID;
-            await updateDeviceState(aquaris, aquarisStateCurrent, aquarisStateExpected, true);
-        } catch (err: unknown) {
-            console.error(`aquarisAPI: connect failed => ${err}`);
-        }
-    })
-
-    .set(AquarisAPIFunctions.disconnect, async (): Promise<void> => {
-        if (await aquarisConnectedDemo()) {
-            await new Promise<void>((resolve: () => void): NodeJS.Timeout => setTimeout(resolve, 600));
-        } else {
-            await aquaris.disconnect();
-        }
-        aquarisStateExpected.deviceUUID = undefined;
-        aquarisStateCurrent.deviceUUID = undefined;
-    })
-
-    .set(AquarisAPIFunctions.isConnected, async (): Promise<boolean> => {
-        if (await aquarisConnectedDemo()) return true;
-
-        if (aquarisIoProgress) {
-            return true;
-        } else {
-            const isConnected: boolean = await aquaris.isConnected();
-            if (!isConnected && aquarisStateExpected !== undefined) {
-                aquarisStateExpected.deviceUUID = undefined;
-            }
-            return isConnected;
-        }
-    })
-
-    .set(AquarisAPIFunctions.hasBluetooth, async (): Promise<boolean> => {
-        return aquarisHasBluetooth || (await aquarisConnectedDemo());
-    })
-
+    // The link is owned/held by an AquarisLink, not by these handlers; connect /
+    // disconnect / discover are therefore no-ops kept for IPC compatibility.
+    .set(AquarisAPIFunctions.connect, async (_deviceUUID: string): Promise<void> => {})
+    .set(AquarisAPIFunctions.disconnect, async (): Promise<void> => {})
+    .set(AquarisAPIFunctions.isConnected, async (): Promise<boolean> => statusConnected())
+    .set(AquarisAPIFunctions.hasBluetooth, async (): Promise<boolean> => true)
     .set(AquarisAPIFunctions.startDiscover, async (): Promise<void> => {})
-
     .set(AquarisAPIFunctions.stopDiscover, async (): Promise<void> => {})
 
     .set(AquarisAPIFunctions.getDevices, async (): Promise<DeviceInfo[]> => {
-        await startSearch();
-        return devicesList;
+        const info: DeviceInfo = new DeviceInfo();
+        info.uuid = AQ_MAC;
+        info.name = 'CoolingSystem';
+        info.rssi = 0;
+        return [info];
     })
 
-    .set(AquarisAPIFunctions.getState, async (): Promise<AquarisState> => {
-        return aquarisStateExpected;
-    })
+    .set(AquarisAPIFunctions.getState, async (): Promise<AquarisState> => readDesired())
 
-    .set(AquarisAPIFunctions.readFwVersion, async (): Promise<string> => {
-        return (await aquaris.readFwVersion()).toString();
-    })
+    .set(AquarisAPIFunctions.readFwVersion, async (): Promise<string> => '')
 
     .set(
         AquarisAPIFunctions.updateLED,
-        async (red: number, green: number, blue: number, state: RGBState | number): Promise<void> => {
-            aquarisStateExpected.red = red;
-            aquarisStateExpected.green = green;
-            aquarisStateExpected.blue = blue;
-            aquarisStateExpected.ledMode = state;
-            aquarisStateExpected.ledOn = true;
-            await updateDeviceState(aquaris, aquarisStateCurrent, aquarisStateExpected);
+        async (red: number, green: number, blue: number, state: number): Promise<void> => {
+            patchDesired({ red, green, blue, ledMode: state, ledOn: true });
         },
     )
-
     .set(AquarisAPIFunctions.writeRGBOff, async (): Promise<void> => {
-        aquarisStateExpected.ledOn = false;
-        await updateDeviceState(aquaris, aquarisStateCurrent, aquarisStateExpected);
+        patchDesired({ ledOn: false });
     })
 
     .set(AquarisAPIFunctions.writeFanMode, async (dutyCyclePercent: number): Promise<void> => {
-        aquarisStateExpected.fanDutyCycle = dutyCyclePercent;
-        aquarisStateExpected.fanOn = true;
-        await updateDeviceState(aquaris, aquarisStateCurrent, aquarisStateExpected);
+        patchDesired({ fanDutyCycle: dutyCyclePercent, fanOn: true });
     })
-
     .set(AquarisAPIFunctions.writeFanOff, async (): Promise<void> => {
-        aquarisStateExpected.fanOn = false;
-        await updateDeviceState(aquaris, aquarisStateCurrent, aquarisStateExpected);
+        patchDesired({ fanOn: false });
     })
 
-    .set(
-        AquarisAPIFunctions.writePumpMode,
-        async (dutyCyclePercent: number, voltage: PumpVoltage | number): Promise<void> => {
-            aquarisStateExpected.pumpDutyCycle = dutyCyclePercent;
-            aquarisStateExpected.pumpVoltage = voltage;
-            aquarisStateExpected.pumpOn = true;
-            await updateDeviceState(aquaris, aquarisStateCurrent, aquarisStateExpected);
-        },
-    )
-
+    .set(AquarisAPIFunctions.writePumpMode, async (dutyCyclePercent: number, voltage: number): Promise<void> => {
+        patchDesired({ pumpDutyCycle: dutyCyclePercent, pumpVoltage: voltage, pumpOn: true });
+    })
     .set(AquarisAPIFunctions.writePumpOff, async (): Promise<void> => {
-        aquarisStateExpected.pumpOn = false;
-        await updateDeviceState(aquaris, aquarisStateCurrent, aquarisStateExpected);
+        patchDesired({ pumpOn: false });
     })
 
-    .set(AquarisAPIFunctions.saveState, async (): Promise<void> => {
-        if (await aquarisConnectedDemo()) return;
-        await userConfig.set('aquarisSaveState', JSON.stringify(aquarisStateCurrent));
-    });
+    // desired.json IS the persistent state — nothing extra to save.
+    .set(AquarisAPIFunctions.saveState, async (): Promise<void> => {});
 
 ipcMain.handle('comp-get-has-aquaris', (_event: IpcMainInvokeEvent): Promise<boolean> => {
     return new Promise<boolean>(

@@ -1,0 +1,17 @@
+[Unit]
+Description=白い熊 Aquaris keeper — holds the BLE link and enforces the desired LED/pump/fan state
+Documentation=man:tccaquaris
+After=bluetooth.target
+Wants=bluetooth.target
+
+[Service]
+Type=simple
+# Run the bundled keeper via the app's own Electron as a plain Node process,
+# using the node-ble bundled inside app.asar (same one the GUI uses).
+Environment=ELECTRON_RUN_AS_NODE=1
+ExecStart=/opt/shiroikuma-tuxedo-control-center/tuxedo-control-center /opt/shiroikuma-tuxedo-control-center/resources/app.asar/dist/tuxedo-control-center/e-app/e-app/aquaris-keeper.js
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
