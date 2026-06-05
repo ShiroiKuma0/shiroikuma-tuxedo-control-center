@@ -37,8 +37,30 @@ const buildNumberPath = path.join(repoRoot, 'build-src', 'fork-build-number');
 const packagesDir = path.join(repoRoot, 'dist', 'packages');
 const tmpDir = path.join(os.homedir(), 'tmp');
 
-const rootPkgRaw = fs.readFileSync(rootPkgPath, 'utf8');
-const srcPkgRaw = fs.readFileSync(srcPkgPath, 'utf8');
+let rootPkgRaw = fs.readFileSync(rootPkgPath, 'utf8');
+let srcPkgRaw = fs.readFileSync(srcPkgPath, 'utf8');
+
+// Self-heal: a build hard-killed mid-package can leave the ROOT package.json in
+// electron-builder's normalized form (no top-level "scripts"), which makes the next
+// `npm run pack-fork` fail with "Missing script: pack-fork". If we reach here with that
+// broken state, recover the committed files from git first so the version we capture
+// (and later restore) is the clean upstream one rather than the broken leftover.
+try {
+    if (!(JSON.parse(rootPkgRaw) as { scripts?: unknown }).scripts) {
+        console.warn(
+            '\x1b[33mbuild-fork: root package.json has no "scripts" (leftover from an interrupted build) — restoring from git\x1b[0m',
+        );
+        execFileSync('git', ['checkout', 'HEAD', '--', 'package.json', path.join('src', 'package.json')], {
+            cwd: repoRoot,
+            stdio: 'inherit',
+        });
+        rootPkgRaw = fs.readFileSync(rootPkgPath, 'utf8');
+        srcPkgRaw = fs.readFileSync(srcPkgPath, 'utf8');
+    }
+} catch (err: unknown) {
+    console.warn(`build-fork: package.json self-heal check failed (continuing): ${err}`);
+}
+
 const baseVersion: string = JSON.parse(rootPkgRaw).version;
 
 const n = parseInt(fs.readFileSync(buildNumberPath, 'utf8').trim(), 10);
@@ -61,10 +83,20 @@ function restorePackageJson(): void {
     fs.writeFileSync(srcPkgPath, srcPkgRaw);
     restored = true;
 }
-// Safety net so a crash/Ctrl-C never leaves the tree with a +N version.
+// Safety net so a crash/Ctrl-C/kill never leaves the tree with a +N (or worse, an
+// electron-builder-normalized, scripts-less) package.json. process.on('exit') does NOT
+// fire for SIGTERM/SIGHUP — the signals a backgrounded or CI build is killed with — so
+// handle those explicitly too.
 process.on('exit', restorePackageJson);
-process.on('SIGINT', (): void => {
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP'] as const) {
+    process.on(sig, (): void => {
+        restorePackageJson();
+        process.exit(1);
+    });
+}
+process.on('uncaughtException', (err: unknown): void => {
     restorePackageJson();
+    console.error(err);
     process.exit(1);
 });
 
