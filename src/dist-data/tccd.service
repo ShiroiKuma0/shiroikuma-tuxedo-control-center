@@ -3,8 +3,8 @@ Description=TUXEDO Control Center Service
 
 [Service]
 Type=simple
-ExecStart=/opt/tuxedo-control-center/resources/dist/tuxedo-control-center/data/service/tccd --start
-ExecStop=/opt/tuxedo-control-center/resources/dist/tuxedo-control-center/data/service/tccd --stop
+ExecStart=/opt/shiroikuma-tuxedo-control-center/resources/dist/tuxedo-control-center/data/service/tccd --start
+ExecStop=/opt/shiroikuma-tuxedo-control-center/resources/dist/tuxedo-control-center/data/service/tccd --stop
 
 [Install]
 WantedBy=multi-user.target

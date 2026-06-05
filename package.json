@@ -1,6 +1,6 @@
 {
-    "name": "tuxedo-control-center",
-    "description": "TUXEDO Control Center Application",
+    "name": "shiroikuma-tuxedo-control-center",
+    "description": "白い熊 TUXEDO Control Center Application",
     "version": "3.0.6",
     "main": "./dist/tuxedo-control-center/e-app/e-app/main.js",
     "author": {
@@ -46,6 +46,7 @@
         "check-release": "tsx ./build-src/check-release.ts",
         "pack-prod": "run-s build-prod && npm run electron-builder",
         "pack-debug": "run-s build-debug && npm run electron-builder",
+        "pack-fork": "tsx ./build-src/build-fork.ts",
         "clean": "rm -rf ./dist; rm -rf ./build; rm -rf ./usr",
         "tests": "npm run test-common && npm run test-service-app && npm run test-appstream",
         "test-common": "tsx node_modules/jasmine/bin/jasmine --config=./src/common/jasmine.json",

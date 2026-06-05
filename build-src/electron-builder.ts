@@ -86,8 +86,19 @@ async function buildDeb(filenameAddition: string): Promise<void> {
             `${distSrc}/data/dist-data/com.tuxedocomputers.tomte.policy`,
             `${distSrc}/data/camera/v4l2_kernel_names.json`,
         ],
+        // Fork build (npm run pack-fork) sets TCC_FORK_VERSION=<base>+<N>. extraMetadata
+        // keeps the +N verbatim in the .deb Version and app.getVersion() (a plain
+        // package.json version would have its +N build-metadata stripped by electron-builder).
+        // build-fork.ts also stamps the same version into src/package.json so the tccd
+        // daemon reports it too — all three must match or the GUI version-check loops.
+        ...(process.env.TCC_FORK_VERSION
+            ? { extraMetadata: { version: process.env.TCC_FORK_VERSION } }
+            : {}),
         linux: {
             target: ['deb'],
+            // Keep the upstream binary/command name even though productName (the /opt
+            // dir + package name) is shiroikuma-tuxedo-control-center.
+            executableName: 'tuxedo-control-center',
             category: 'System',
             icon: `${distSrc}/data/dist-data/tuxedo-control-center_256.svg`,
         },
@@ -101,6 +112,10 @@ async function buildDeb(filenameAddition: string): Promise<void> {
             fpm: [
                 '--conflicts=tuxedofancontrol',
                 '--replaces=tuxedofancontrol',
+                // Replace mode: this fork supersedes upstream tuxedo-control-center.
+                '--conflicts=tuxedo-control-center',
+                '--replaces=tuxedo-control-center',
+                '--provides=tuxedo-control-center',
                 '--inputs=build-src/package-files.txt',
                 '--deb-compression-level=9',
             ],

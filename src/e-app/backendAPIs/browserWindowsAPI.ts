@@ -161,7 +161,7 @@ async function createTccWindow(langId: string, module?: string): Promise<void> {
     }
 
     tccWindow = new BrowserWindow({
-        title: 'TUXEDO Control Center',
+        title: '白い熊 TUXEDO Control Center',
         width: windowWidth,
         height: windowHeight,
         frame: true,

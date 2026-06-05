@@ -39,8 +39,8 @@ export class TccTray {
     public async create(): Promise<void> {
         if (!this.tray) {
             this.tray = new Tray(this.trayIcon);
-            this.tray.setTitle('TUXEDO Control Center');
-            this.tray.setToolTip('TUXEDO Control Center');
+            this.tray.setTitle('白い熊 TUXEDO Control Center');
+            this.tray.setToolTip('白い熊 TUXEDO Control Center');
         }
 
         const profilesSubmenu: MenuItemConstructorOptions[] = this.state.profiles.map(
