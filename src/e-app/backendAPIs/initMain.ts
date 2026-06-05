@@ -51,6 +51,12 @@ const appPath: string = __dirname.replace('app.asar/', '');
 const autostartLocation: string = path.join(os.homedir(), '.config/autostart');
 const autostartDesktopFilename = 'tuxedo-control-center-tray.desktop';
 export const translation = new NgTranslations();
+// Fork: electron-builder derives the Electron app name from the packaging productName
+// (shiroikuma-tuxedo-control-center). Pin the *runtime* identity back to upstream so that
+// ~/.config/<name>/, the X11 WM_CLASS (matching the .desktop StartupWMClass) and the
+// SingletonLock path all stay 'tuxedo-control-center'. Must run before any userData path
+// is resolved (i.e. before requestSingleInstanceLock below).
+app.setName('tuxedo-control-center');
 const applicationLock: boolean = app.requestSingleInstanceLock();
 
 if (watchOption) {
@@ -115,7 +121,9 @@ function exitIfProcessExists(): void {
             if (userDataDir) {
                 singletonLockPath = path.join(userDataDir, 'SingletonLock');
             } else {
-                singletonLockPath = '~/.config/tuxedo-control-center/SingletonLock';
+                // Fork: read the lock from Electron's actual userData dir rather than a
+                // hard-coded ~ path, so it is correct regardless of the resolved app name.
+                singletonLockPath = path.join(app.getPath('userData'), 'SingletonLock');
             }
 
             singletonLock = child_process.execSync(`readlink ${singletonLockPath}`).toString().trim();
