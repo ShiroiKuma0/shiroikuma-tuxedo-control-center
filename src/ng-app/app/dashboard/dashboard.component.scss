@@ -21,12 +21,17 @@
     display: block;
     position: absolute;
     top: 10px;
-    bottom: 25px;
+    // Fork: was 25px — the container ended up ~10px shorter than its content, forcing a
+    // permanent vertical scrollbar at startup. Shrinking the bottom offset gives the
+    // container enough height for the dashboard to fit.
+    bottom: 5px;
     right: 5px;
     left: 0px;
     margin: 0px;
     padding: 0px;
-    overflow-y: scroll;
+    // Fork: was `scroll` (scrollbar always visible). `auto` only shows it when content
+    // genuinely overflows — which, with the taller container above, it no longer does.
+    overflow-y: auto;
 }
 
 .inner-dashboard {
@@ -38,11 +43,14 @@
     flex-flow: row;
     justify-content: space-evenly;
 
-    margin: 10px auto 30px auto;
+    // Fork: trimmed from 10/30 — the dashboard is tall (two gauge rows) and overflowed the
+    // default-size window by ~40px; reclaiming this inter-section spacing makes it fit without
+    // a scrollbar at the default window, independent of (flaky) window-pixel sizing.
+    margin: 6px auto 10px auto;
     padding-bottom: 5px;
 
     &.bottom {
-        margin-bottom: 30px;
+        margin-bottom: 10px;
     }
 }
 
@@ -72,7 +80,8 @@
 }
 
 .active-tcc-profile {
-    padding-bottom: 15px;
+    // Fork: trimmed from 15px (part of the dashboard-fits-default-window adjustment above).
+    padding-bottom: 5px;
 }
 
 .profile-overview {
