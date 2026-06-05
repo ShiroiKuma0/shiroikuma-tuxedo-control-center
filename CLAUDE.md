@@ -126,8 +126,14 @@ Because we keep `com.tuxedocomputers.tccd` on the system bus, headless control w
 GetFanDataJSON` (CPU temp + fan), `… GetProfilesJSON` / `… SetTempProfile s "<name>"` (switch
 profile; `SetTempProfile*` is temporary, reverts on AC/battery change — persist via `/etc/tcc/settings`).
 Aquaris (fan / LED / pump) is GUI + Bluetooth-only (`src/e-app/LCT21001.ts`,
-`src/e-app/backendAPIs/aquarisAPI.ts`) and is **not** on D-Bus — exposing Aquaris on the daemon's
-D-Bus interface is a candidate `custom`-branch feature (see `HANDOFF.md` §8).
+`src/e-app/backendAPIs/aquarisAPI.ts`) and is **not** on D-Bus, so it needs the GUI running.
+
+**Candidate `custom`-branch feature (the payoff of owning this fork):** expose Aquaris on the daemon's
+D-Bus interface — e.g. `AquarisConnect` / `AquarisDisconnect` / `AquarisSetFan(i)` / `AquarisSetLed(s)`
+in `TccDBusInterface.ts` / `TccDBusService.ts`, backed by a daemon-side port of the `LCT21001` BLE
+logic. That would make all of the original goals (incl. connect / set levels / disconnect Aquaris)
+controllable over SSH. It's a meaningful chunk of work — moving BLE from `e-app` into the daemon — and
+was out of scope for the initial fork.
 
 ## Architecture (upstream, unchanged)
 

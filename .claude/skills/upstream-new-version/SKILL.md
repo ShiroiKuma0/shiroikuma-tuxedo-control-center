@@ -36,7 +36,7 @@ fresh `+1` build.
    value (`npm version <ver> --no-git-tag-version` in root and in `src/`, or `npm run ver -- <ver>`).
    **Reset `build-src/fork-build-number` to `1`.**
 
-5. **Verify our customizations are intact** (the audit table in `HANDOFF.md` §2 / `CLAUDE.md`):
+5. **Verify our customizations are intact** (the customization table in `CLAUDE.md`):
    package name `shiroikuma-tuxedo-control-center`; install dir
    `/opt/shiroikuma-tuxedo-control-center`; `linux.executableName: 'tuxedo-control-center'`;
    `extraMetadata` from `TCC_FORK_VERSION`; deb fpm `Conflicts/Replaces/Provides: tuxedo-control-center`;
