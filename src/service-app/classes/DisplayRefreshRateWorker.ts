@@ -32,6 +32,8 @@ export class DisplayRefreshRateWorker extends DaemonWorker {
     private previousUsers: string[] = [];
     private wAvailable: boolean = undefined;
     private disallowedUserNames: string[] = ['sddm', 'gdm', 'gdm-gree', 'root'];
+    // Guard so a slow `w` can never overlap with the next 5s tick (see checkUsers).
+    private wInFlight: boolean = false;
 
     constructor(tccd: TuxedoControlCenterDaemon) {
         super(5000, 'DisplayRefreshrateWorker', tccd);
@@ -50,10 +52,54 @@ export class DisplayRefreshRateWorker extends DaemonWorker {
         }
     }
 
+    // Run `w --no-header` without ever blocking the daemon's single event loop.
+    // FORK FIX: upstream used child_process.execSync here, which freezes the whole
+    // D-Bus interface while `w` runs. On a system whose process table had been
+    // bloated by a leaked-SSH-session storm, `w` (it scans all of /proc) took
+    // 20s+, so every GetProfilesJSON / SetTempProfile call hung — profile
+    // switching in the GUI and the CLI appeared stuck. Run it async with a hard
+    // timeout (< the 5s poll interval) and SIGKILL on overrun so a pathological
+    // `w` can never wedge the daemon. Returns null on failure/timeout.
+    private runW(): Promise<string | null> {
+        return new Promise((resolve: (value: string | null) => void): void => {
+            child_process.exec(
+                'w --no-header',
+                { timeout: 4000, killSignal: 'SIGKILL', maxBuffer: 4 * 1024 * 1024 },
+                (err: unknown, stdout: string): void => {
+                    if (err) {
+                        console.error(`DisplayRefreshrateWorker: 'w --no-header' failed or timed out => ${err}`);
+                        resolve(null);
+                    } else {
+                        resolve(stdout);
+                    }
+                },
+            );
+        });
+    }
+
     // user is able to switch XDG_SESSION_TYPE in login screen and thus a new check needs to be done
     // not checking XDG_SESSION_TYPE during login screen, checking again on user change
-    private checkUsers(): boolean[] {
-        const userInformation: string[] = child_process.execSync('w --no-header').toString().split('\n');
+    private async checkUsers(): Promise<boolean[]> {
+        // Skip if a previous `w` is still running (system under load): report the
+        // last known availability and "no change" so we neither block nor flap.
+        if (this.wInFlight) {
+            return [this.previousUsers.length > 0, false];
+        }
+
+        this.wInFlight = true;
+        let output: string | null;
+        try {
+            output = await this.runW();
+        } finally {
+            this.wInFlight = false;
+        }
+
+        // On failure/timeout keep the previous state and report no change.
+        if (output === null) {
+            return [this.previousUsers.length > 0, false];
+        }
+
+        const userInformation: string[] = output.split('\n');
 
         const loggedInUsers: string[] = [];
 
@@ -88,7 +134,7 @@ export class DisplayRefreshRateWorker extends DaemonWorker {
             return;
         }
 
-        const [usersAvailable, usersChanged] = this.checkUsers();
+        const [usersAvailable, usersChanged] = await this.checkUsers();
 
         if (usersChanged) {
             this.resetToDefault();

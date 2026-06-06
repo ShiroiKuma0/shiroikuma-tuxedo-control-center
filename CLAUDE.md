@@ -77,6 +77,21 @@ low-churn. The display label `白い熊 TUXEDO Control Center` lives only in the
   was tried and dropped). Verified via DevTools after full render (+ `Page.captureScreenshot`) that
   `.dashboard` no longer overflows at 770 px.
 
+### Daemon robustness fixes (preserve on rebase)
+
+- **Non-blocking `w` in `DisplayRefreshRateWorker`**
+  (`src/service-app/classes/DisplayRefreshRateWorker.ts`): upstream `checkUsers()` runs
+  `child_process.execSync('w --no-header')` on the daemon's **single event loop** every 5 s. `w`
+  scans all of `/proc`, so when the process table is bloated (e.g. a leaked-SSH-session storm) it
+  takes 20 s+ and freezes the **entire D-Bus interface** while it runs — `GetProfilesJSON` /
+  `SetTempProfile` hang, so CLI (`tccprofile`) and GUI profile switching appear stuck. Fork makes
+  `checkUsers()` `async`: a `runW()` helper uses `child_process.exec` with
+  `{ timeout: 4000, killSignal: 'SIGKILL' }` (< the 5 s poll) plus a `wInFlight` guard that skips
+  overlapping runs; on failure/timeout it keeps prior state and reports "no change". Parsing/regex is
+  byte-for-byte upstream — only the exec mechanism changed. (Diagnosed 2026-06-06; root trigger was a
+  WireGuard peer at `10.9.0.3` leaking ~750 idle `sshd` sessions. Mitigated host-side too with an
+  `sshd` `ClientAliveInterval 60` / `ClientAliveCountMax 3` drop-in, which lives outside this repo.)
+
 ### Versioning & .deb naming
 
 - `version` tracks upstream (currently `3.0.6`), kept clean.
