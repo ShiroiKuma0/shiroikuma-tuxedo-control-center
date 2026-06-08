@@ -92,6 +92,25 @@ low-churn. The display label `白い熊 TUXEDO Control Center` lives only in the
   WireGuard peer at `10.9.0.3` leaking ~750 idle `sshd` sessions. Mitigated host-side too with an
   `sshd` `ClientAliveInterval 60` / `ClientAliveCountMax 3` drop-in, which lives outside this repo.)
 
+- **Authoritative `--new_settings` reload in `TuxedoControlCenterDaemon`**
+  (`src/service-app/classes/TuxedoControlCenterDaemon.ts`, `SIGHUP` handler): upstream's reload path
+  runs `loadConfigsAndProfiles()` (which *preserves* the in-memory active profile by id) then
+  `triggerStateCheck(true)` (which only calls `stateWorker.reapplyProfile()`, **not** `reset()`). So a
+  `tccd --new_settings` write that rewrites `stateMap[<state>]` to the value it *already* held leaves a
+  stale in-memory temp-profile override (e.g. one the GUI left behind via `SetTempProfile`) active —
+  the clear-temp-and-apply-stateMap branch in `StateSwitcherWorker.onWork()` only fires on a *genuine*
+  change, so `tccprofile N` to the already-mapped profile silently no-ops. Fork adds
+  `this.stateWorker.reset()` (guarded) in the `SIGHUP` handler **before** `triggerStateCheck(true)`, so
+  every settings reload re-derives the active profile from the freshly-written `stateMap` and drops any
+  temp override. `reapplyProfile()` is kept (still re-applies when a profile's *contents* changed but
+  its id didn't). Scoped to the `SIGHUP` handler only — **not** `triggerStateCheck()` itself, which the
+  D-Bus path (`TccDBusInterface.ts`) calls right after `SetTempProfile*` and must not reset.
+  Trade-off: a temp profile no longer survives a `--new_settings` reload (acceptable — temp profiles
+  already revert on the next AC/battery flip; click-to-activate uses `SetTempProfile`, which sends no
+  `SIGHUP`, so that flow is untouched). Companion to the `~/0/bin/tccprofile` wrapper's
+  `SetTempProfileById` push (outside this repo), which becomes a harmless no-op once this ships but
+  keeps the wrapper correct against an older `tccd`. (Diagnosed 2026-06-08.)
+
 ### Versioning & .deb naming
 
 - `version` tracks upstream (currently `3.0.6`), kept clean.

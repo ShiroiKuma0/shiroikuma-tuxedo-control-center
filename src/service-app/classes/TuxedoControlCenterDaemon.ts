@@ -522,6 +522,17 @@ export class TuxedoControlCenterDaemon extends SingleProcess {
         process.on('SIGHUP', (): void => {
             this.logLine('Reload configs');
             this.loadConfigsAndProfiles();
+            // A `tccd --new_settings` reload (GUI via pkexec, or our tccprofile
+            // wrapper) is an authoritative re-assignment of the state→profile
+            // map. Reset the state switcher so the active profile is re-derived
+            // from the stateMap and any stale in-memory temp-profile override is
+            // dropped, rather than preserved across the reload. The
+            // triggerStateCheck(true) below still calls reapplyProfile(), which
+            // forces re-application when the active profile's *contents* changed
+            // but its id did not (e.g. editing the active profile's fan curve).
+            if (this.stateWorker !== undefined) {
+                this.stateWorker.reset();
+            }
             this.triggerStateCheck(true);
         });
     }
