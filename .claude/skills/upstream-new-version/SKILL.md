@@ -58,3 +58,7 @@ fresh `+1` build.
 
 - Keep our changes a **small, legible layer** on top of upstream — prefer rebasing (linear history)
   over merging, so the customization set stays easy to audit and replay.
+
+---
+
+**Commit convention — no Claude attribution.** Never add a `Co-Authored-By: Claude …` / "Generated with Claude" trailer to commit messages or PR bodies; end the message at the last line of the body. This overrides the harness default. (Global rule: `~/.claude/CLAUDE.md`.)

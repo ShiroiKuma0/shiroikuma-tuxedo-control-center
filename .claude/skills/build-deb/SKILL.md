@@ -49,3 +49,7 @@ description: Build the 白い熊 TUXEDO Control Center .deb with the pack-fork f
 - Plain (non-fork-numbered) packaging is still `npm run pack-prod` (deb + rpm). We ship the fork deb.
 - If electron-builder asks for `fpm` or `bsdtar`, it usually downloads fpm itself; `bsdtar` may need
   `sudo apt install libarchive-tools` — ask 白い熊 before any sudo apt.
+
+---
+
+**Commit convention — no Claude attribution.** Never add a `Co-Authored-By: Claude …` / "Generated with Claude" trailer to commit messages or PR bodies; end the message at the last line of the body. This overrides the harness default. (Global rule: `~/.claude/CLAUDE.md`.)
