@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+#
+# tccinfo — print the 白い熊 TUXEDO Control Center "dashboard" (first page) over D-Bus.
+#
+# Headless-friendly: talks to the running tccd daemon on the system bus, exactly
+# like the GUI dashboard does. No X server / Electron needed.
+#
+#   tccinfo       one-shot report
+#   tccinfo -m    monitor mode: live-updating report (like the GUI dials), press q to quit
+#
+set -uo pipefail
+
+BUS=com.tuxedocomputers.tccd
+OBJ=/com/tuxedocomputers/tccd
+INTERVAL=1   # monitor refresh period (seconds)
+
+die() { printf 'tccinfo: %s\n' "$*" >&2; exit 1; }
+usage() { printf 'usage: tccinfo [-m]\n  -m  monitor: keep updating until q is pressed\n' >&2; exit 2; }
+
+MONITOR=false
+while getopts ':m' opt; do
+    case "$opt" in
+        m) MONITOR=true;;
+        *) usage;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 0 ] || usage
+
+command -v busctl >/dev/null || die "busctl not found"
+command -v jq     >/dev/null || die "jq not found"
+
+# Call a no-arg, string-returning tccd method and emit the inner JSON.
+dj() { busctl --json=short --system call "$BUS" "$OBJ" "$BUS" "$1" 2>/dev/null | jq -r '.data[0] // empty'; }
+
+[ "$(busctl --json=short --system call "$BUS" "$OBJ" "$BUS" dbusAvailable 2>/dev/null | jq -r '.data[0] // false')" = "true" ] \
+    || die "tccd not reachable on the system bus (is the daemon running?)"
+
+# ---- temperature unit (honour the GUI's Fahrenheit setting) -----------------
+USE_F=false
+[ -r /etc/tcc/settings ] && USE_F=$(jq -r '.fahrenheit // false' /etc/tcc/settings 2>/dev/null)
+temp() { # $1 = celsius (number or -1/empty -> N/A)
+    local c="$1"
+    case "$c" in ''|-1|-1.*) printf 'N/A'; return;; esac
+    awk -v c="$c" -v f="$USE_F" 'BEGIN{ if(f=="true"){printf "%d °F", c*9/5+32} else {printf "%d °C", c} }'
+}
+pct()  { case "$1" in ''|-1|-1.*) printf 'N/A';; *) printf '%d %%' "$(printf '%.0f' "$1")";; esac; }
+watt() { case "$1" in ''|-*) printf 'N/A';; *) printf '%d W' "$(printf '%.0f' "$1")";; esac; }   # any negative = invalid sample
+mhz()  { case "$1" in ''|-1|-1.*|0) printf 'N/A';; *) awk -v v="$1" 'BEGIN{printf "%.2f GHz", v/1000}';; esac; }
+
+j() { printf '%s' "$2" | jq -r "$1" 2>/dev/null; }
+
+# ---- sensor collection (GUI does this on the dashboard) ----------------------
+# tccd auto-disables collection 10 s after the last GPU-info read, and a hidden
+# GUI dashboard turns it off explicitly — so monitor mode re-asserts it each cycle.
+PREV=$(busctl --json=short --system call "$BUS" "$OBJ" "$BUS" GetSensorDataCollectionStatus 2>/dev/null | jq -r '.data[0] // false')
+sensors_on()      { busctl --system call "$BUS" "$OBJ" "$BUS" SetSensorDataCollectionStatus b true  >/dev/null 2>&1; }
+sensors_restore() { [ "$PREV" = "true" ] || busctl --system call "$BUS" "$OBJ" "$BUS" SetSensorDataCollectionStatus b false >/dev/null 2>&1; }
+
+# ---- fetch + derive all displayed values -------------------------------------
+collect() {
+    FAN=$(dj GetFanDataJSON)
+    CPUPWR=$(dj GetCpuPowerValuesJSON)
+    DGPU=$(dj GetDGpuInfoValuesJSON)
+    IGPU=$(dj GetIGpuInfoValuesJSON)
+    PROF=$(dj GetActiveProfileJSON)
+    DGPU_AVAIL=$(busctl --json=short --system call "$BUS" "$OBJ" "$BUS" GetDGpuAvailable 2>/dev/null | jq -r '.data[0] // 0')
+
+    PROFILE_NAME=$(j '.name // "?"' "$PROF")
+
+    CPU_TEMP=$(j '.cpu.temp.data'   "$FAN")
+    CPU_FAN=$( j '.cpu.speed.data'  "$FAN")
+    GPU_TEMP=$(j '.gpu1.temp.data'  "$FAN")
+    GPU_FAN=$( j '.gpu1.speed.data' "$FAN")
+
+    CPU_PDRAW=$(j '.powerDraw'      "$CPUPWR")
+    CPU_PMAX=$( j '.maxPowerLimit'  "$CPUPWR")
+
+    # average current CPU frequency from sysfs (kHz -> GHz), like the dashboard's gauge
+    CPU_GHZ=$(awk '{s+=$1;n++} END{ if(n>0) printf "%.2f GHz", (s/n)/1e6; else print "N/A" }' \
+        /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null)
+    [ -n "$CPU_GHZ" ] || CPU_GHZ="N/A"
+
+    DGPU_PDRAW=$(j '.powerDraw'      "$DGPU")
+    DGPU_FREQ=$( j '.coreFrequency'  "$DGPU")
+    IGPU_TEMP=$( j '.temp'           "$IGPU")
+    IGPU_FREQ=$( j '.coreFrequency'  "$IGPU")
+    IGPU_PDRAW=$(j '.powerDraw'      "$IGPU")
+}
+
+# ---- render -----------------------------------------------------------------
+render() {
+    printf '\n  白い熊 TUXEDO Control Center\n\n'
+    printf '  Profile : %s\n\n' "$PROFILE_NAME"
+
+    printf '  CPU\n'
+    printf '    Temp   : %s\n' "$(temp "$CPU_TEMP")"
+    printf '    Fan    : %s\n' "$(pct  "$CPU_FAN")"
+    printf '    Freq   : %s   (avg)\n' "$CPU_GHZ"
+    case "$CPU_PDRAW" in
+        ''|-*) printf '    Power  : N/A\n';;
+        *)     printf '    Power  : %s / %s\n' "$(watt "$CPU_PDRAW")" "$(watt "$CPU_PMAX")";;
+    esac
+
+    printf '\n  GPU (discrete)\n'
+    if [ "$DGPU_AVAIL" = "1" ]; then
+        printf '    Temp   : %s\n' "$(temp "$GPU_TEMP")"
+        printf '    Fan    : %s\n' "$(pct  "$GPU_FAN")"
+        if [ -n "$DGPU_PDRAW" ] && [ "$DGPU_PDRAW" != "-1" ]; then
+            printf '    Power  : %s\n' "$(watt "$DGPU_PDRAW")"
+            printf '    Freq   : %s\n' "$(mhz  "$DGPU_FREQ")"
+        else
+            printf '    Power  : N/A   (off)\n'
+            printf '    Freq   : N/A   (off)\n'
+        fi
+    else
+        printf '    not available\n'
+    fi
+
+    printf '\n  iGPU\n'
+    printf '    Temp   : %s\n' "$(temp "$IGPU_TEMP")"
+    printf '    Freq   : %s\n' "$(mhz  "$IGPU_FREQ")"
+    printf '    Power  : %s\n' "$(watt "$IGPU_PDRAW")"
+    printf '\n'
+}
+
+# ---- monitor mode -------------------------------------------------------------
+if $MONITOR; then
+    [ -t 0 ] && [ -t 1 ] || die "-m needs an interactive terminal"
+
+    # No alternate screen: the last frame stays in the terminal after quitting.
+    cleanup() {
+        printf '\r\033[2K'       # erase the "press q to quit" hint line
+        tput cnorm 2>/dev/null   # cursor back
+        sensors_restore
+    }
+    trap cleanup EXIT
+    trap 'exit 0' INT TERM
+
+    tput civis 2>/dev/null
+    printf '\033[H\033[2J\n  collecting sensor data…\n'
+    sensors_on
+    sleep 1.2
+
+    while :; do
+        sensors_on   # keep-alive (tccd's 10 s timeout / GUI may switch it off)
+        collect
+        FRAME=$(render; printf '  every %ss — press q to quit' "$INTERVAL")
+        printf '\033[H%s\033[J' "$FRAME"
+        KEY=''
+        read -rsn1 -t "$INTERVAL" KEY || true
+        case "$KEY" in q|Q) exit 0;; esac
+    done
+fi
+
+# ---- one-shot ------------------------------------------------------------------
+sensors_on
+sleep 1.2
+collect
+sensors_restore
+render

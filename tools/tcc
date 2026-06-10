@@ -1,0 +1,277 @@
+#!/usr/bin/env bash
+#
+# tcc — combined live monitor for the 白い熊 TUXEDO Control Center stack.
+#
+# Three columns, refreshed every second, in the current screen (the last frame
+# stays on the terminal after quitting):
+#
+#   1. dashboard readings (CPU / dGPU / iGPU)  — what `tccinfo -m` shows
+#   2. profile list                             — p  switches a profile (like `tccprofile N`)
+#   3. Aquaris state                            — a  toggles cooling on/off
+#                                                 f  edits fan % (Enter applies)
+#                                                 l  toggles the LED
+#   q quits.
+#
+set -uo pipefail
+
+BUS=com.tuxedocomputers.tccd
+OBJ=/com/tuxedocomputers/tccd
+INTERVAL=1
+W1=26; W2=24; W3=28           # column widths (characters)
+
+SELF_DIR=$(dirname "$(readlink -f "$0")")
+AQ_CFG="$HOME/.config/tccaquaris"
+AQ_DESIRED="$AQ_CFG/desired.json"
+AQ_STATUS="$AQ_CFG/status.json"
+AQ_SVC=tccaquaris-keeper.service
+
+die() { printf 'tcc: %s\n' "$*" >&2; exit 1; }
+command -v busctl >/dev/null || die "busctl not found"
+command -v jq     >/dev/null || die "jq not found"
+[ -t 0 ] && [ -t 1 ] || die "tcc needs an interactive terminal"
+
+dj() { busctl --json=short --system call "$BUS" "$OBJ" "$BUS" "$1" 2>/dev/null | jq -r '.data[0] // empty'; }
+j()  { printf '%s' "$2" | jq -r "$1" 2>/dev/null; }
+
+[ "$(busctl --json=short --system call "$BUS" "$OBJ" "$BUS" dbusAvailable 2>/dev/null | jq -r '.data[0] // false')" = "true" ] \
+    || die "tccd not reachable on the system bus (is the daemon running?)"
+
+# ---- formatting (same conventions as tccinfo) --------------------------------
+USE_F=false
+[ -r /etc/tcc/settings ] && USE_F=$(jq -r '.fahrenheit // false' /etc/tcc/settings 2>/dev/null)
+temp() {
+    local c="$1"
+    case "$c" in ''|-1|-1.*) printf 'N/A'; return;; esac
+    awk -v c="$c" -v f="$USE_F" 'BEGIN{ if(f=="true"){printf "%d °F", c*9/5+32} else {printf "%d °C", c} }'
+}
+pct()  { case "$1" in ''|-1|-1.*) printf 'N/A';; *) printf '%d %%' "$(printf '%.0f' "$1")";; esac; }
+watt() { case "$1" in ''|-*) printf 'N/A';; *) printf '%d W' "$(printf '%.0f' "$1")";; esac; }   # any negative = invalid sample
+mhz()  { case "$1" in ''|-1|-1.*|0) printf 'N/A';; *) awk -v v="$1" 'BEGIN{printf "%.2f GHz", v/1000}';; esac; }
+
+# pad/truncate to a display width in characters (UTF-8-aware via ${#})
+pad() {
+    local s="${1-}" w="$2"
+    s=${s:0:w}
+    printf '%s%*s' "$s" $(( w - ${#s} )) ''
+}
+
+power_state() {
+    local d
+    for d in /sys/class/power_supply/*/; do
+        [ "$(cat "$d/type" 2>/dev/null)" = "Mains" ] || continue
+        [ "$(cat "$d/online" 2>/dev/null)" = "1" ] && { echo power_ac; return; }
+    done
+    echo power_bat
+}
+
+# ---- sensor collection keep-alive (see tccinfo) -------------------------------
+PREV=$(busctl --json=short --system call "$BUS" "$OBJ" "$BUS" GetSensorDataCollectionStatus 2>/dev/null | jq -r '.data[0] // false')
+sensors_on()      { busctl --system call "$BUS" "$OBJ" "$BUS" SetSensorDataCollectionStatus b true  >/dev/null 2>&1; }
+sensors_restore() { [ "$PREV" = "true" ] || busctl --system call "$BUS" "$OBJ" "$BUS" SetSensorDataCollectionStatus b false >/dev/null 2>&1; }
+
+# ---- data collection -----------------------------------------------------------
+collect() {
+    FAN=$(dj GetFanDataJSON)
+    CPUPWR=$(dj GetCpuPowerValuesJSON)
+    DGPU=$(dj GetDGpuInfoValuesJSON)
+    IGPU=$(dj GetIGpuInfoValuesJSON)
+    PROF=$(dj GetActiveProfileJSON)
+    PROFILES=$(dj GetProfilesJSON)
+    DGPU_AVAIL=$(busctl --json=short --system call "$BUS" "$OBJ" "$BUS" GetDGpuAvailable 2>/dev/null | jq -r '.data[0] // 0')
+
+    ACTIVE_ID=$(j '.id // empty' "$PROF")
+    POWER=$(power_state)
+
+    CPU_TEMP=$(j '.cpu.temp.data'   "$FAN")
+    CPU_FAN=$( j '.cpu.speed.data'  "$FAN")
+    GPU_TEMP=$(j '.gpu1.temp.data'  "$FAN")
+    GPU_FAN=$( j '.gpu1.speed.data' "$FAN")
+    CPU_PDRAW=$(j '.powerDraw'      "$CPUPWR")
+    CPU_PMAX=$( j '.maxPowerLimit'  "$CPUPWR")
+
+    CPU_GHZ=$(awk '{s+=$1;n++} END{ if(n>0) printf "%.2f GHz", (s/n)/1e6; else print "N/A" }' \
+        /sys/devices/system/cpu/cpu*/cpufreq/scaling_cur_freq 2>/dev/null)
+    [ -n "$CPU_GHZ" ] || CPU_GHZ="N/A"
+
+    DGPU_PDRAW=$(j '.powerDraw'      "$DGPU")
+    DGPU_FREQ=$( j '.coreFrequency'  "$DGPU")
+    IGPU_TEMP=$( j '.temp'           "$IGPU")
+    IGPU_FREQ=$( j '.coreFrequency'  "$IGPU")
+    IGPU_PDRAW=$(j '.powerDraw'      "$IGPU")
+}
+
+# ---- column renderers (one line per output line) --------------------------------
+render_dash() {
+    printf 'CPU\n'
+    printf '  Temp  : %s\n' "$(temp "$CPU_TEMP")"
+    printf '  Fan   : %s\n' "$(pct  "$CPU_FAN")"
+    printf '  Freq  : %s\n' "$CPU_GHZ"
+    case "$CPU_PDRAW" in
+        ''|-*) printf '  Power : N/A\n';;
+        *)     printf '  Power : %s / %s\n' "$(watt "$CPU_PDRAW")" "$(watt "$CPU_PMAX")";;
+    esac
+    printf '\ndGPU\n'
+    if [ "$DGPU_AVAIL" = "1" ]; then
+        printf '  Temp  : %s\n' "$(temp "$GPU_TEMP")"
+        printf '  Fan   : %s\n' "$(pct  "$GPU_FAN")"
+        case "$DGPU_PDRAW" in
+            ''|-*) printf '  Power : N/A  (off)\n  Freq  : N/A  (off)\n';;
+            *)     printf '  Power : %s\n  Freq  : %s\n' "$(watt "$DGPU_PDRAW")" "$(mhz "$DGPU_FREQ")";;
+        esac
+    else
+        printf '  not available\n'
+    fi
+    printf '\niGPU\n'
+    printf '  Temp  : %s\n' "$(temp "$IGPU_TEMP")"
+    printf '  Freq  : %s\n' "$(mhz  "$IGPU_FREQ")"
+    printf '  Power : %s\n' "$(watt "$IGPU_PDRAW")"
+}
+
+render_profiles() {
+    printf 'Profiles (%s)\n\n' "${POWER#power_}"
+    printf '%s' "$PROFILES" | jq -r 'to_entries[] | "\(.key+1)\t\(.value.id)\t\(.value.name)"' 2>/dev/null |
+    while IFS=$'\t' read -r n id name; do
+        local mark='○'; [ "$id" = "$ACTIVE_ID" ] && mark='●'
+        printf '%s %d %s\n' "$mark" "$n" "${name:0:$((W2-5))}"
+    done
+}
+
+render_aquaris() {
+    local fanOn ledOn fan r g b link owner conn
+    fanOn=$(jq -r '.fanOn  // false' "$AQ_DESIRED" 2>/dev/null)
+    ledOn=$(jq -r '.ledOn  // false' "$AQ_DESIRED" 2>/dev/null)
+    fan=$(  jq -r '.fanDutyCycle // "?"' "$AQ_DESIRED" 2>/dev/null)
+    r=$(jq -r '.red // 0' "$AQ_DESIRED" 2>/dev/null)
+    g=$(jq -r '.green // 0' "$AQ_DESIRED" 2>/dev/null)
+    b=$(jq -r '.blue // 0' "$AQ_DESIRED" 2>/dev/null)
+
+    if systemctl --user is-active --quiet "$AQ_SVC" 2>/dev/null; then
+        owner=$(jq -r '.owner // empty'     "$AQ_STATUS" 2>/dev/null)
+        conn=$( jq -r '.connected // false' "$AQ_STATUS" 2>/dev/null)
+        if [ "$owner" = "gui" ]; then link='held by GUI'
+        elif [ "$conn" = "true" ]; then link='keeper (held)'
+        else link='keeper: no device'
+        fi
+    else
+        link='keeper stopped'
+    fi
+
+    printf 'Aquaris\n\n'
+    printf 'Link    : %s\n' "$link"
+    if [ "$fanOn" = "true" ]; then
+        printf 'Cooling : ON\n'
+    else
+        printf 'Cooling : off\n'
+    fi
+    printf 'Fan     : %s %%\n' "$fan"
+    if [ "$ledOn" = "true" ]; then
+        printf 'LED     : on  RGB(%s,%s,%s)\n' "$r" "$g" "$b"
+    else
+        printf 'LED     : off\n'
+    fi
+}
+
+# ---- frame assembly --------------------------------------------------------------
+fill() { local -n _arr=$1; while (( ${#_arr[@]} < $2 )); do _arr+=(''); done; }
+
+build_frame() {
+    local A B C
+    mapfile -t A < <(render_dash)
+    mapfile -t B < <(render_profiles)
+    mapfile -t C < <(render_aquaris)
+
+    # footers, bottom-aligned: every column ends on the "q quit" row, with at
+    # least one blank line between the tallest body and its footer
+    local pcount; pcount=$(printf '%s' "$PROFILES" | jq 'length' 2>/dev/null) || pcount=0
+    local digits; (( pcount > 9 )) && digits=9 || digits=$pcount
+    local F1=('q quit')
+    local F2=("1-${digits} set profile" 'p switch profile')
+    local F3=('a cooling on/off' 'f fan % (Enter sets)' 'l LED on/off')
+
+    local rows=$(( ${#A[@]} + 1 + ${#F1[@]} )) n
+    n=$(( ${#B[@]} + 1 + ${#F2[@]} )); (( n > rows )) && rows=$n
+    n=$(( ${#C[@]} + 1 + ${#F3[@]} )); (( n > rows )) && rows=$n
+    fill A $(( rows - ${#F1[@]} )); A+=("${F1[@]}")
+    fill B $(( rows - ${#F2[@]} )); B+=("${F2[@]}")
+    fill C $(( rows - ${#F3[@]} )); C+=("${F3[@]}")
+
+    printf '  白い熊 TUXEDO Control Center\n\n'
+    local i
+    for (( i = 0; i < rows; i++ )); do
+        printf '  %s │ %s │ %s\n' "$(pad "${A[i]:-}" "$W1")" "$(pad "${B[i]:-}" "$W2")" "$(pad "${C[i]:-}" "$W3")"
+    done
+}
+
+# ---- interactive actions -----------------------------------------------------------
+# Prompts run in normal (cooked, echoing) mode at the bottom of the frame; the
+# next refresh repaints over them.
+prompt_profile() {
+    tput cnorm 2>/dev/null
+    printf '\n  switch to profile #: '
+    local n; IFS= read -r n
+    tput civis 2>/dev/null
+    case "$n" in ''|*[!0-9]*) return;; esac
+    switch_profile "$n"
+}
+
+switch_profile() {
+    printf '\n  switching…'
+    "$SELF_DIR/tccprofile" "$1" >/dev/null 2>&1   # sudo may prompt on the tty here
+}
+
+prompt_fan() {
+    tput cnorm 2>/dev/null
+    printf '\n  fan %%: '
+    local n; IFS= read -r n
+    tput civis 2>/dev/null
+    case "$n" in ''|*[!0-9]*) return;; esac
+    [ "$n" -le 100 ] || return
+    "$SELF_DIR/tccaquaris" fan "$n" >/dev/null 2>&1
+}
+
+aq_toggle_cooling() {
+    if [ "$(jq -r '.fanOn // false' "$AQ_DESIRED" 2>/dev/null)" = "true" ]; then
+        "$SELF_DIR/tccaquaris" off >/dev/null 2>&1
+    else
+        "$SELF_DIR/tccaquaris" on >/dev/null 2>&1
+    fi
+}
+
+aq_toggle_led() {
+    if [ "$(jq -r '.ledOn // false' "$AQ_DESIRED" 2>/dev/null)" = "true" ]; then
+        "$SELF_DIR/tccaquaris" led off >/dev/null 2>&1
+    else
+        "$SELF_DIR/tccaquaris" led on >/dev/null 2>&1
+    fi
+}
+
+# ---- main loop ----------------------------------------------------------------------
+cleanup() {
+    tput cnorm 2>/dev/null
+    printf '\n'
+    sensors_restore
+}
+trap cleanup EXIT
+trap 'exit 0' INT TERM
+
+tput civis 2>/dev/null
+printf '\033[H\033[2J\n  collecting sensor data…\n'
+sensors_on
+sleep 1.2
+
+while :; do
+    sensors_on   # keep-alive (tccd's 10 s timeout / GUI may switch it off)
+    collect
+    FRAME=$(build_frame)
+    printf '\033[H%s\033[J' "$FRAME"
+    KEY=''
+    read -rsn1 -t "$INTERVAL" KEY || true
+    case "$KEY" in
+        q|Q) exit 0;;
+        p|P) prompt_profile;;
+        [1-9]) switch_profile "$KEY";;
+        a|A) aq_toggle_cooling;;
+        f|F) prompt_fan;;
+        l|L) aq_toggle_led;;
+    esac
+done

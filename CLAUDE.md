@@ -162,6 +162,20 @@ profile; `SetTempProfile*` is temporary, reverts on AC/battery change — persis
 Aquaris (fan / LED / pump) is GUI + Bluetooth-only (`src/e-app/LCT21001.ts`,
 `src/e-app/backendAPIs/aquarisAPI.ts`) and is **not** on D-Bus, so it needs the GUI running.
 
+### `tools/` — headless CLI wrappers (canonical copies)
+
+`tools/` holds 白い熊's CLI wrappers around the above; the **live** copies run from `~/0/bin`
+(on PATH) — after editing, sync both locations. Not packaged into the .deb.
+
+- `tcc` — interactive 3-column live monitor (dashboard | profiles | Aquaris), 1 s refresh, last
+  frame stays on quit. Keys: `q` quit, `1`-`9` / `p` switch profile, `a` Aquaris cooling toggle,
+  `f` fan % (Enter sets), `l` LED toggle.
+- `tccinfo [-m]` — the dashboard readings, one-shot or live (`-m`).
+- `tccprofile [N]` — list profiles / persistently switch (stateMap write via `sudo tccd
+  --new_settings` + `SetTempProfileById` push).
+- `tccaquaris` — Aquaris control by editing `~/.config/tccaquaris/desired.json`, applied by
+  whoever holds the BLE link (keeper service or GUI).
+
 **Candidate `custom`-branch feature (the payoff of owning this fork):** expose Aquaris on the daemon's
 D-Bus interface — e.g. `AquarisConnect` / `AquarisDisconnect` / `AquarisSetFan(i)` / `AquarisSetLed(s)`
 in `TccDBusInterface.ts` / `TccDBusService.ts`, backed by a daemon-side port of the `LCT21001` BLE

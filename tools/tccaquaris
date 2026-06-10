@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+#
+# tccaquaris — remote control for a TUXEDO Aquaris (LCT21001 / LCT22002).
+#
+# A background keeper service (tccaquaris-keeper) holds ONE BLE connection and
+# continuously enforces a desired state. This CLI just edits that desired state;
+# the keeper applies it within ~1.5s over the held link.
+#
+# Why a keeper: the device firmware lights its LED blue whenever it is powered
+# but NOT connected. Holding a connection that keeps the LED off is the only way
+# to keep it dark while staying remotely controllable. Idle = LED off, fan off —
+# so it can sit powered for days with the LED dark.
+#
+#   tccaquaris                 show status
+#   tccaquaris on [pct]        cooling on (fan on; optional fan % 1-100)
+#   tccaquaris off             cooling off (fan off)
+#   tccaquaris fan <0-100>     set fan speed (0 = off)
+#   tccaquaris led on|off      LED on (saved colour) / off
+#   tccaquaris led R G B [mode] set LED colour (mode 0=Static 1=Breathe 2=Colorful 3=BreatheColor)
+#   tccaquaris start           start + enable the keeper (run once; survives logout)
+#   tccaquaris stop|release    stop the keeper (frees the device for the GUI; LED reverts to blue)
+#   tccaquaris restart|svc     restart / show the keeper service
+#
+# The LCT22002 is fan-only: the "fan" drives the cooling; there is no usable pump
+# control (the GUI hides it too), so this CLI has no pump command.
+#
+set -uo pipefail
+
+CFG="$HOME/.config/tccaquaris"
+DESIRED="$CFG/desired.json"
+STATUS="$CFG/status.json"
+SVC="tccaquaris-keeper.service"
+MAC="${AQ_MAC:-EE:5E:11:D8:5A:B5}"
+DEFAULT='{"red":0,"green":119,"blue":255,"ledMode":0,"fanDutyCycle":50,"pumpDutyCycle":60,"pumpVoltage":3,"ledOn":false,"fanOn":false,"pumpOn":false}'
+
+die(){ printf 'tccaquaris: %s\n' "$*" >&2; exit 1; }
+command -v jq >/dev/null || die "jq not found"
+mkdir -p "$CFG"
+[ -f "$DESIRED" ] || printf '%s\n' "$DEFAULT" | jq . > "$DESIRED"
+
+dset(){ local t; t=$(mktemp) && jq -c "$1" "$DESIRED" > "$t" && mv "$t" "$DESIRED" || die "failed to update desired state"; }
+dget(){ jq -r "$1" "$DESIRED" 2>/dev/null; }
+sget(){ [ -f "$STATUS" ] && jq -r "$1" "$STATUS" 2>/dev/null; }
+keeper_active(){ systemctl --user is-active --quiet "$SVC"; }
+
+modename(){ case "$1" in 0) echo Static;; 1) echo Breathe;; 2) echo Colorful;; 3) echo BreatheColor;; *) echo "mode$1";; esac; }
+
+show(){
+  local fanOn ledOn fan r g b mode conn err
+  fanOn=$(dget '.fanOn'); ledOn=$(dget '.ledOn')
+  fan=$(dget '.fanDutyCycle')
+  r=$(dget '.red'); g=$(dget '.green'); b=$(dget '.blue'); mode=$(dget '.ledMode')
+
+  printf '\n  Aquaris  (LCT22002, %s)\n\n' "$MAC"
+  local owner
+  if keeper_active; then
+    owner=$(sget '.owner'); conn=$(sget '.connected'); err=$(sget '.error')
+    if [ "$owner" = "gui" ]; then
+      printf '  Link    : held by the GUI (keeper yielded) — LED enforced by the GUI\n'
+    elif [ "$conn" = "true" ]; then
+      printf '  Link    : held by the keeper — LED state enforced\n'
+    else
+      printf '  Link    : keeper running, not connected — %s\n' "${err:-device unreachable (powered off / out of range)}"
+    fi
+  else
+    printf '  Link    : keeper stopped — device shows its blue idle LED when powered\n'
+    printf '            run "tccaquaris start" to hold it dark and enable control\n'
+  fi
+
+  if [ "$fanOn" = "true" ]; then
+    printf '  Cooling : ON   (fan %s%%)\n' "$fan"
+  else
+    printf '  Cooling : off  (fan idle, last %s%%)\n' "$fan"
+  fi
+  if [ "$ledOn" = "true" ]; then
+    printf '  LED     : on   RGB(%s,%s,%s) %s\n' "$r" "$g" "$b" "$(modename "$mode")"
+  else
+    printf '  LED     : off\n'
+  fi
+  printf '\n'
+}
+
+note_keeper(){ keeper_active || printf '  (note: keeper is stopped — changes apply once you run "tccaquaris start")\n'; }
+
+case "${1:-}" in
+  ''|status|show)
+    show ;;
+
+  start)
+    systemctl --user enable --now "$SVC" || die "failed to start keeper service"
+    # linger so it keeps running across logout (for headless, days-long use)
+    if [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
+      loginctl enable-linger "$USER" 2>/dev/null || sudo loginctl enable-linger "$USER" 2>/dev/null \
+        || printf '  (could not enable linger; keeper may stop on logout — run: sudo loginctl enable-linger %s)\n' "$USER"
+    fi
+    sleep 2; show ;;
+
+  stop|release)
+    systemctl --user disable --now "$SVC" 2>/dev/null || systemctl --user stop "$SVC"
+    printf '  keeper stopped — the device is free for the GUI; its LED will show blue while powered.\n'
+    show ;;
+
+  restart)
+    systemctl --user restart "$SVC"; sleep 2; show ;;
+
+  svc|service)
+    systemctl --user status "$SVC" --no-pager 2>&1 | head -20 ;;
+
+  on)
+    # cooling on (the fan IS the cooling control on the LCT22002; pump does nothing).
+    if [ -n "${2:-}" ]; then case "$2" in *[!0-9]*) die "usage: tccaquaris on [0-100]";; esac
+      [ "$2" -ge 1 ] && [ "$2" -le 100 ] || die "fan pct must be 1..100"; dset ".fanDutyCycle=$2"; fi
+    dset '.fanOn=true | .pumpOn=false'
+    printf '  cooling ON\n'; note_keeper; show ;;
+
+  off)
+    dset '.fanOn=false | .pumpOn=false'
+    printf '  cooling off\n'; note_keeper; show ;;
+
+  fan)
+    n="${2:-}"; case "$n" in ''|*[!0-9]*) die "usage: tccaquaris fan <0-100>";; esac
+    [ "$n" -ge 0 ] && [ "$n" -le 100 ] || die "fan must be 0..100"
+    if [ "$n" -eq 0 ]; then dset '.fanOn=false'; else dset ".fanDutyCycle=$n | .fanOn=true"; fi
+    note_keeper; show ;;
+
+  led)
+    case "${2:-}" in
+      on)  dset '.ledOn=true';  note_keeper; show ;;
+      off) dset '.ledOn=false'; note_keeper; show ;;
+      ''|*[!0-9]*) die "usage: tccaquaris led on|off  |  tccaquaris led R G B [mode]" ;;
+      *) r="$2"; g="${3:-}"; b="${4:-}"; m="${5:-0}"
+         case "$g$b" in *[!0-9]*|'') die "usage: tccaquaris led R G B [mode]";; esac
+         for v in "$r" "$g" "$b"; do { [ "$v" -ge 0 ] && [ "$v" -le 255 ]; } || die "R/G/B must be 0..255"; done
+         { [ "$m" -ge 0 ] && [ "$m" -le 3 ]; } || die "mode must be 0..3"
+         dset ".red=$r | .green=$g | .blue=$b | .ledMode=$m | .ledOn=true"; note_keeper; show ;;
+    esac ;;
+
+  -h|--help|help)
+    awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0" ;;
+
+  *) die "unknown command: $1  (try: tccaquaris --help)" ;;
+esac

@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+#
+# tccprofile — list TUXEDO profiles, or switch to one by number.
+#
+#   tccprofile        list profiles (active one marked ON)
+#   tccprofile N      switch to profile #N for the *current* power source
+#
+# Switching mirrors the GUI exactly: it rewrites stateMap[<power_ac|power_bat>]
+# in /etc/tcc/settings and hands the file to the privileged tccd binary
+# (`tccd --new_settings`), which persists it and SIGHUPs the running daemon to
+# apply it immediately. The GUI uses pkexec for that; headless we use sudo.
+#
+set -uo pipefail
+
+BUS=com.tuxedocomputers.tccd
+OBJ=/com/tuxedocomputers/tccd
+
+die() { printf 'tccprofile: %s\n' "$*" >&2; exit 1; }
+command -v busctl >/dev/null || die "busctl not found"
+command -v jq     >/dev/null || die "jq not found"
+
+dj() { busctl --json=short --system call "$BUS" "$OBJ" "$BUS" "$1" 2>/dev/null | jq -r '.data[0] // empty'; }
+
+PROFILES=$(dj GetProfilesJSON)
+[ -n "$PROFILES" ] || die "tccd not reachable on the system bus (is the daemon running?)"
+
+active_id() { dj GetActiveProfileJSON | jq -r '.id // empty'; }
+
+list() {
+    local active; active=$(active_id)
+    local power; power=$(power_state)
+    printf '\n  Profiles   (active marked ●, current source: %s)\n\n' "${power#power_}"
+    printf '%s' "$PROFILES" | jq -r '
+        to_entries[] |
+        "\(.key+1)\t\(.value.id)\t\(.value.name)\t\(.value.description // "")"' |
+    while IFS=$'\t' read -r n id name desc; do
+        local mark on
+        if [ "$id" = "$active" ]; then mark='●'; on='ON '; else mark='○'; on='off'; fi
+        if [ -n "$desc" ]; then
+            printf '  %s %2d. %-22s %s   — %s\n' "$mark" "$n" "$name" "$on" "$desc"
+        else
+            printf '  %s %2d. %-22s %s\n' "$mark" "$n" "$name" "$on"
+        fi
+    done
+    printf '\n'
+}
+
+power_state() {
+    local d
+    for d in /sys/class/power_supply/*/; do
+        [ "$(cat "$d/type" 2>/dev/null)" = "Mains" ] || continue
+        [ "$(cat "$d/online" 2>/dev/null)" = "1" ] && { echo power_ac; return; }
+    done
+    echo power_bat
+}
+
+tccd_bin() {
+    local p
+    p=$(systemctl show -p ExecStart --value tccd 2>/dev/null | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -1)
+    [ -n "$p" ] && [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+    for p in \
+        /opt/shiroikuma-tuxedo-control-center/resources/dist/tuxedo-control-center/data/service/tccd \
+        /opt/tuxedo-control-center/resources/dist/tuxedo-control-center/data/service/tccd; do
+        [ -x "$p" ] && { printf '%s' "$p"; return 0; }
+    done
+    return 1
+}
+
+# ---- no argument: just list -------------------------------------------------
+if [ $# -eq 0 ]; then
+    list
+    exit 0
+fi
+
+# ---- argument: switch -------------------------------------------------------
+N="$1"
+case "$N" in ''|*[!0-9]*) die "expected a profile number; run 'tccprofile' to see the list";; esac
+
+COUNT=$(printf '%s' "$PROFILES" | jq 'length')
+{ [ "$N" -ge 1 ] && [ "$N" -le "$COUNT" ]; } || die "no profile #$N (have 1..$COUNT)"
+
+TARGET_ID=$(  printf '%s' "$PROFILES" | jq -r ".[$((N-1))].id")
+TARGET_NAME=$(printf '%s' "$PROFILES" | jq -r ".[$((N-1))].name")
+STATE=$(power_state)
+
+[ -r /etc/tcc/settings ] || die "/etc/tcc/settings not readable"
+TCCD=$(tccd_bin) || die "could not locate the tccd binary"
+
+NEW=$(jq -c --arg st "$STATE" --arg id "$TARGET_ID" '.stateMap[$st]=$id' /etc/tcc/settings) \
+    || die "failed to build new settings"
+
+TMP=$(mktemp /tmp/tccprofile.XXXXXX) || die "mktemp failed"
+trap 'rm -f "$TMP"' EXIT
+printf '%s' "$NEW" > "$TMP"
+
+printf '  Switching %s → "%s" (#%d)…\n' "${STATE#power_}" "$TARGET_NAME" "$N"
+SUDO=""; [ "$(id -u)" -eq 0 ] || SUDO="sudo"
+
+$SUDO "$TCCD" --new_settings "$TMP" || die "tccd --new_settings failed"
+
+# The stateMap write above is persistent but does NOT clear an in-memory
+# temp-profile override the daemon may be holding (e.g. one the GUI left
+# behind when it last "activated" a profile). On reload tccd preserves the
+# active profile and only re-derives it from the stateMap on a *genuine*
+# change, so requesting the profile the stateMap already points at would
+# leave the stale override active. Push the target as a temp profile too, to
+# make it active immediately; with the stateMap now pointing at the same
+# profile, that "temp" choice is effectively permanent (it reverts to the
+# same profile on the next AC/battery change). Unprivileged — no sudo needed.
+busctl --system call "$BUS" "$OBJ" "$BUS" SetTempProfileById s "$TARGET_ID" >/dev/null 2>&1
+
+# wait for the daemon to apply (SIGHUP reload)
+for _ in $(seq 1 20); do
+    [ "$(active_id)" = "$TARGET_ID" ] && break
+    sleep 0.2
+done
+
+if [ "$(active_id)" = "$TARGET_ID" ]; then
+    printf '  ✓ now active: %s\n' "$TARGET_NAME"
+else
+    printf '  ! requested %s, but active is still "%s"\n' "$TARGET_NAME" "$(dj GetActiveProfileJSON | jq -r '.name')"
+fi
+
+list
