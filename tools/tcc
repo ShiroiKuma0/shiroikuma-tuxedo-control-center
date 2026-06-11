@@ -12,12 +12,28 @@
 #                                                 l  toggles the LED
 #   q quits.
 #
+# On terminals narrower than the full 86-column frame (e.g. 58-column SSH
+# sessions) a narrow layout is used automatically: dashboard | profiles side
+# by side, Aquaris stacked below, one-line key footer. The width is re-read
+# every frame, so resizing switches layouts live. Force a layout with
+# `tcc -n|--narrow` or `tcc -w|--wide`.
+#
 set -uo pipefail
 
 BUS=com.tuxedocomputers.tccd
 OBJ=/com/tuxedocomputers/tccd
 INTERVAL=1
 W1=26; W2=24; W3=28           # column widths (characters)
+FULL_W=$(( 2 + W1 + 3 + W2 + 3 + W3 ))   # total width of the wide frame
+
+MODE=auto
+case "${1-}" in
+    '')          ;;
+    -n|--narrow) MODE=narrow;;
+    -w|--wide)   MODE=wide;;
+    -h|--help)   printf 'usage: tcc [-n|--narrow | -w|--wide]\n'; exit 0;;
+    *)           printf 'tcc: unknown option: %s\n' "$1" >&2; exit 1;;
+esac
 
 SELF_DIR=$(dirname "$(readlink -f "$0")")
 AQ_CFG="$HOME/.config/tccaquaris"
@@ -44,8 +60,8 @@ temp() {
     case "$c" in ''|-1|-1.*) printf 'N/A'; return;; esac
     awk -v c="$c" -v f="$USE_F" 'BEGIN{ if(f=="true"){printf "%d °F", c*9/5+32} else {printf "%d °C", c} }'
 }
-pct()  { case "$1" in ''|-1|-1.*) printf 'N/A';; *) printf '%d %%' "$(printf '%.0f' "$1")";; esac; }
-watt() { case "$1" in ''|-*) printf 'N/A';; *) printf '%d W' "$(printf '%.0f' "$1")";; esac; }   # any negative = invalid sample
+pct()  { case "$1" in ''|-1|-1.*) printf 'N/A';; *) printf '%d %%' "$(LC_ALL=C printf '%.0f' "$1")";; esac; }   # LC_ALL=C: %.0f rejects "." floats under ja_JP
+watt() { case "$1" in ''|-*) printf 'N/A';; *) printf '%d W' "$(LC_ALL=C printf '%.0f' "$1")";; esac; }   # any negative = invalid sample
 mhz()  { case "$1" in ''|-1|-1.*|0) printf 'N/A';; *) awk -v v="$1" 'BEGIN{printf "%.2f GHz", v/1000}';; esac; }
 
 # pad/truncate to a display width in characters (UTF-8-aware via ${#})
@@ -174,7 +190,41 @@ render_aquaris() {
 # ---- frame assembly --------------------------------------------------------------
 fill() { local -n _arr=$1; while (( ${#_arr[@]} < $2 )); do _arr+=(''); done; }
 
+profile_digits() {
+    local pcount; pcount=$(printf '%s' "$PROFILES" | jq 'length' 2>/dev/null) || pcount=0
+    (( pcount > 9 )) && pcount=9
+    printf '%d' "$pcount"
+}
+
+frame_mode() {
+    case "$MODE" in narrow|wide) printf '%s' "$MODE"; return;; esac
+    local cols; cols=$(tput cols 2>/dev/null) || cols=${COLUMNS:-80}
+    if (( cols < FULL_W )); then printf 'narrow'; else printf 'wide'; fi
+}
+
 build_frame() {
+    if [ "$(frame_mode)" = narrow ]; then build_frame_narrow; else build_frame_wide; fi
+}
+
+# narrow (< FULL_W columns, e.g. a 58-column SSH session): dashboard | profiles
+# side by side (2+W1+3+W2 = 55 cols), Aquaris below, one-line key footer
+build_frame_narrow() {
+    local A B
+    mapfile -t A < <(render_dash)
+    mapfile -t B < <(render_profiles)
+    local rows=${#A[@]}; (( ${#B[@]} > rows )) && rows=${#B[@]}
+
+    printf '  白い熊 TUXEDO Control Center\n\n'
+    local i
+    for (( i = 0; i < rows; i++ )); do
+        printf '  %s │ %s\n' "$(pad "${A[i]:-}" "$W1")" "$(pad "${B[i]:-}" "$W2")"
+    done
+    printf '\n'
+    render_aquaris | while IFS= read -r line; do printf '  %s\n' "$line"; done
+    printf '\n  q quit · 1-%s/p profile · a cool · f fan%% · l LED\n' "$(profile_digits)"
+}
+
+build_frame_wide() {
     local A B C
     mapfile -t A < <(render_dash)
     mapfile -t B < <(render_profiles)
@@ -182,8 +232,7 @@ build_frame() {
 
     # footers, bottom-aligned: every column ends on the "q quit" row, with at
     # least one blank line between the tallest body and its footer
-    local pcount; pcount=$(printf '%s' "$PROFILES" | jq 'length' 2>/dev/null) || pcount=0
-    local digits; (( pcount > 9 )) && digits=9 || digits=$pcount
+    local digits; digits=$(profile_digits)
     local F1=('q quit')
     local F2=("1-${digits} set profile" 'p switch profile')
     local F3=('a cooling on/off' 'f fan % (Enter sets)' 'l LED on/off')
