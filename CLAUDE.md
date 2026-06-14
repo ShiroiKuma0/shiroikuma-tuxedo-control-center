@@ -136,7 +136,9 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
 - **Aquaris tracks the internal (PC) fan %:** `computeAquarisTarget` maps PC-fan → Aquaris linearly
   (`aquarisPcFanMin..aquarisPcFanMax` ⇒ `0..aquarisFanMax`; defaults 50..100 ⇒ 0..100, i.e. ~10%
   Aquaris per 5% PC-fan), **off at/below `aquarisPcFanMin`** (50%). So the Aquaris winds *down with*
-  the laptop fan rather than cutting from 100→off.
+  the laptop fan rather than cutting from 100→off. **Lead floor:** while `hot` (load present), the duty
+  is floored at `aquarisLeadDuty` (50) so the Aquaris leads the laptop fan's spin-up instead of waiting
+  ~10 s for it to ramp; `hot` clears the instant load stops, so the wind-down/off is pure PC-fan curve.
 - **Rest is gated on cool-down, not just idle:** the profile drops to rest only when load is gone
   (`cool`, EMA) **and** the PC fan has wound past `aquarisPcFanMin` (`cooled`) — `restReady = cool &&
   cooled` — held for `releaseSec`. So profile #1 holds while the laptop is still actively cooling, and

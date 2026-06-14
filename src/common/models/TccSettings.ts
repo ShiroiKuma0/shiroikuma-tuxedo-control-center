@@ -85,6 +85,10 @@ export interface IAutopilotSettings {
     aquarisPcFanMin: number;
     aquarisPcFanMax: number;
     aquarisFanMax: number;
+    /** Lead floor: while under load (the instant the attack triggers), apply at least
+     *  this Aquaris % so it leads the laptop fan's spin-up. The PC-fan curve governs
+     *  once it climbs past this and through the whole wind-down. 0 = no lead. */
+    aquarisLeadDuty: number;
 }
 
 export const defaultAutopilotSettings: IAutopilotSettings = {
@@ -109,6 +113,7 @@ export const defaultAutopilotSettings: IAutopilotSettings = {
     aquarisPcFanMin: 50,
     aquarisPcFanMax: 100,
     aquarisFanMax: 100,
+    aquarisLeadDuty: 50,
 };
 
 export interface ITccSettings {

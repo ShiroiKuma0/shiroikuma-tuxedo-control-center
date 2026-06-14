@@ -178,9 +178,9 @@ export class AutoProfileWorker extends DaemonWorker {
         }
 
         // ---- Aquaris fan target: tracks the internal (PC) fan % — scales down
-        // with it and only switches off below aquarisPcFanMin. Not gated by the
-        // manual *profile* pause. ----
-        const aquaris: AquarisAutoTarget = this.computeAquarisTarget(cfg, signals);
+        // with it and only switches off below aquarisPcFanMin — but leads the fan's
+        // spin-up via a lead floor while `hot`. Not gated by the manual *profile* pause. ----
+        const aquaris: AquarisAutoTarget = this.computeAquarisTarget(cfg, signals, hot);
         this.tccd.dbusData.aquarisAutoTargetJSON = JSON.stringify(aquaris);
 
         this.tccd.dbusData.autopilotStatusJSON = JSON.stringify({
@@ -303,19 +303,22 @@ export class AutoProfileWorker extends DaemonWorker {
 
     // ---- helpers ------------------------------------------------------------
 
-    private computeAquarisTarget(cfg: IAutopilotSettings, signals: AutopilotSignals): AquarisAutoTarget {
+    private computeAquarisTarget(cfg: IAutopilotSettings, signals: AutopilotSignals, hot: boolean): AquarisAutoTarget {
         if (!cfg.aquarisEnabled) {
             return { enabled: false, fanOn: false, fanDutyCycle: 0 };
         }
-        // Track the internal (PC) fan %: OFF at/below aquarisPcFanMin, then scaling
-        // linearly to aquarisFanMax at aquarisPcFanMax. With the defaults (50→100 PC
-        // fan ⇒ 0→100 Aquaris) that's ~10% Aquaris per 5% PC-fan change.
+        // PC-fan curve: OFF at/below aquarisPcFanMin, scaling linearly to
+        // aquarisFanMax at aquarisPcFanMax (defaults 50→100 PC fan ⇒ 0→100 Aquaris,
+        // ~10% Aquaris per 5% PC-fan).
         const pcFan: number = signals.internalFan;
-        if (pcFan < 0) {
-            return { enabled: true, fanOn: false, fanDutyCycle: 0 }; // no PC-fan reading
-        }
         const span: number = Math.max(1, cfg.aquarisPcFanMax - cfg.aquarisPcFanMin);
-        const duty: number = Math.round(clamp(((pcFan - cfg.aquarisPcFanMin) / span) * cfg.aquarisFanMax, 0, cfg.aquarisFanMax));
+        const pcDuty: number = pcFan < 0 ? 0 : clamp(((pcFan - cfg.aquarisPcFanMin) / span) * cfg.aquarisFanMax, 0, cfg.aquarisFanMax);
+        // Lead the laptop fan's spin-up: while under load (`hot`), floor the duty at
+        // aquarisLeadDuty so the Aquaris reacts immediately instead of waiting for the
+        // PC fan to ramp. `hot` clears the instant load stops, so the wind-down/off
+        // is governed purely by the PC-fan curve (unchanged).
+        const leadDuty: number = hot ? cfg.aquarisLeadDuty : 0;
+        const duty: number = Math.round(clamp(Math.max(pcDuty, leadDuty), 0, cfg.aquarisFanMax));
         return { enabled: true, fanOn: duty > 0, fanDutyCycle: duty };
     }
 
