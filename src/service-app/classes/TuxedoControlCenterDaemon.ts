@@ -28,9 +28,10 @@ import { TccPaths } from '../../common/classes/TccPaths';
 import { defaultCustomProfile, TUXEDODevice } from '../../common/models/DefaultProfiles';
 import { customFanPreset, type ITccFanProfile } from '../../common/models/TccFanTable';
 import { FrequencyConfig, generateProfileId, type ITccProfile } from '../../common/models/TccProfile';
-import { type ITccSettings, ProfileStates } from '../../common/models/TccSettings';
+import { defaultAutopilotSettings, type ITccSettings, ProfileStates } from '../../common/models/TccSettings';
 import type { WebcamPreset } from '../../common/models/TccWebcamSettings';
 import { ModuleInfo, type TDPInfo, TuxedoIOAPI } from '../../native-lib/TuxedoIOAPI';
+import { AutoProfileWorker } from './AutoProfileWorker';
 import { ChargingWorker } from './ChargingWorker';
 import { CpuPowerWorker } from './CpuPowerWorker';
 import { CpuWorker } from './CpuWorker';
@@ -74,6 +75,7 @@ export class TuxedoControlCenterDaemon extends SingleProcess {
     protected started: boolean = false;
 
     private stateWorker: StateSwitcherWorker;
+    private autoProfileWorker: AutoProfileWorker;
     private chargingWorker: ChargingWorker;
     private displayWorker: DisplayRefreshRateWorker;
     constructor() {
@@ -120,6 +122,8 @@ export class TuxedoControlCenterDaemon extends SingleProcess {
         this.workers.push(new YCbCr420WorkaroundWorker(this));
         this.workers.push(new GpuInfoWorker(this, new AvailabilityService()));
         this.workers.push(new CpuPowerWorker(this));
+        this.autoProfileWorker = new AutoProfileWorker(this);
+        this.workers.push(this.autoProfileWorker);
         this.workers.push(new PrimeWorker(this));
         this.workers.push(new TccDBusService(this, this.dbusData));
         this.workers.push(new ODMProfileWorker(this));
@@ -467,6 +471,17 @@ export class TuxedoControlCenterDaemon extends SingleProcess {
             }
             missingSetting = this.syncOutputPortsSetting();
 
+            // Autopilot settings (fork) — forward-compatible: fill the whole block
+            // if absent (persisted via the throw->recreate path below), otherwise
+            // merge defaults so newly-added keys appear without clobbering edits.
+            if (this.settings.autopilot === undefined) {
+                this.logLine('TuxedoControlCenterDaemon: Missing autopilot settings');
+                this.settings.autopilot = { ...defaultAutopilotSettings };
+                missingSetting = true;
+            } else {
+                this.settings.autopilot = { ...defaultAutopilotSettings, ...this.settings.autopilot };
+            }
+
             if (missingSetting) {
                 throw Error('TuxedoControlCenterDaemon: Missing setting');
             }
@@ -736,6 +751,45 @@ export class TuxedoControlCenterDaemon extends SingleProcess {
 
     public updateDBusActiveProfileData(): void {
         this.dbusData.activeProfileJSON = JSON.stringify(this.fillDeviceSpecificDefaults(this.getCurrentProfile()));
+    }
+
+    // ---- Autopilot (fork): runtime control of settings.autopilot ----
+
+    public setAutopilotEnabled(enabled: boolean): void {
+        if (this.settings.autopilot === undefined) {
+            this.settings.autopilot = { ...defaultAutopilotSettings };
+        }
+        this.settings.autopilot.enabled = enabled;
+        this.persistAutopilotSettings();
+        // Re-enabling clears any manual-pick pause so control resumes at once.
+        if (enabled && this.autoProfileWorker !== undefined) {
+            this.autoProfileWorker.clearPause();
+        }
+    }
+
+    public setAutopilotSettingsJSON(settingsJSON: string): boolean {
+        try {
+            const patch: Partial<typeof defaultAutopilotSettings> = JSON.parse(settingsJSON);
+            this.settings.autopilot = {
+                ...defaultAutopilotSettings,
+                ...(this.settings.autopilot ?? {}),
+                ...patch,
+            };
+            this.persistAutopilotSettings();
+            return true;
+        } catch (err: unknown) {
+            console.error(`TuxedoControlCenterDaemon: setAutopilotSettingsJSON failed => ${err}`);
+            return false;
+        }
+    }
+
+    private persistAutopilotSettings(): void {
+        try {
+            this.config.writeSettings(this.settings);
+            this.dbusData.settingsJSON = JSON.stringify(this.settings);
+        } catch (err: unknown) {
+            console.error(`TuxedoControlCenterDaemon: Failed to persist autopilot settings => ${err}`);
+        }
     }
 
     // todo: function too long, could be splitted with cpu, display, webcam, fan, odm subfunctions

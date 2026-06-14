@@ -37,6 +37,7 @@
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as dbus from 'dbus-next';
 import type * as NodeBle from 'node-ble';
 import { createBluetooth } from 'node-ble';
 
@@ -53,6 +54,15 @@ export interface AquarisDesired {
     ledOn: boolean;
     fanOn: boolean;
     pumpOn: boolean;
+    // Autopilot (fork): when true, the daemon's auto fan target overrides the
+    // fan fields below (LED/pump stay user-controlled).
+    auto?: boolean;
+}
+
+interface AquarisAutoTarget {
+    enabled: boolean;
+    fanOn: boolean;
+    fanDutyCycle: number;
 }
 
 interface OwnerLock {
@@ -83,7 +93,11 @@ const DEFAULT_DESIRED: AquarisDesired = {
     ledOn: false,
     fanOn: false,
     pumpOn: false,
+    auto: false,
 };
+
+const TCCD_BUS_NAME = 'com.tuxedocomputers.tccd';
+const TCCD_PATH = '/com/tuxedocomputers/tccd';
 
 function sleep(ms: number): Promise<void> {
     return new Promise<void>((resolve: () => void): NodeJS.Timeout => setTimeout(resolve, ms));
@@ -112,6 +126,10 @@ export class AquarisLink {
     private uartTx: NodeBle.GattCharacteristic | undefined;
 
     private applied: { led?: string; fan?: string; pump?: string } = {};
+
+    // Autopilot (fork): lazy system-bus link to tccd for the auto fan target.
+    private tccBus: dbus.MessageBus | undefined;
+    private tccIface: dbus.ClientInterface | undefined;
 
     constructor(
         private readonly role: AquarisRole,
@@ -191,9 +209,39 @@ export class AquarisLink {
         // (GUI lock heartbeat runs on its own timer — see start())
 
         const desired: AquarisDesired = this.readDesired();
+        // Autopilot: let the daemon's fan target drive the fan (LED/pump stay manual).
+        // On any D-Bus error we keep the file's fan values (fail-safe).
+        if (desired.auto) {
+            const target: AquarisAutoTarget | null = await this.getAquarisAutoTarget();
+            if (target !== null && target.enabled) {
+                desired.fanOn = target.fanOn;
+                desired.fanDutyCycle = target.fanDutyCycle;
+            }
+        }
         await this.connect(); // retries internally; throws if device busy/absent (caught by loop)
         await this.applyDesired(desired);
         this.writeStatus({ owner: this.role, device: this.mac, connected: true, applied: desired, error: null });
+    }
+
+    // ---- autopilot fan target (from tccd over the system bus) ----------------
+    private async getAquarisAutoTarget(): Promise<AquarisAutoTarget | null> {
+        try {
+            if (this.tccIface === undefined) {
+                if (this.tccBus === undefined) {
+                    this.tccBus = dbus.systemBus();
+                }
+                const proxy = await this.tccBus.getProxyObject(TCCD_BUS_NAME, TCCD_PATH);
+                this.tccIface = proxy.getInterface(TCCD_BUS_NAME);
+            }
+            const json: string = await this.tccIface.GetAquarisAutoTargetJSON();
+            const t = JSON.parse(json);
+            if (typeof t?.fanDutyCycle === 'number') {
+                return { enabled: !!t.enabled, fanOn: !!t.fanOn, fanDutyCycle: t.fanDutyCycle };
+            }
+        } catch (_e: unknown) {
+            this.tccIface = undefined; // force reconnect next time
+        }
+        return null;
     }
 
     // ---- ownership lock -----------------------------------------------------

@@ -48,6 +48,12 @@ export class TccDBusData {
     public modeReapplyPending: boolean;
     public tempProfileName: string = '';
     public tempProfileId: string = '';
+    // Autopilot (fork): timestamp of the last EXTERNAL manual profile pick
+    // (set only by SetTempProfile*), the autopilot's live status, and the Aquaris
+    // fan target the keeper applies over BLE.
+    public manualProfileOverrideTs: number = 0;
+    public autopilotStatusJSON: string = '{}';
+    public aquarisAutoTargetJSON: string = '{}';
     public activeProfileJSON: string = '{}';
     public profilesJSON: string = '{}';
     public customProfilesJSON: string = '{}';
@@ -72,6 +78,9 @@ export class TccDBusData {
 export class TccDBusOptions {
     public triggerStateCheck?: () => Promise<void>;
     public chargingWorker?: ChargingWorker;
+    // Autopilot (fork): mutate + persist settings.autopilot via the daemon.
+    public setAutopilotEnabled?: (enabled: boolean) => void;
+    public setAutopilotSettings?: (settingsJSON: string) => boolean;
 }
 
 export class TccDBusInterface extends dbus.interface.Interface {
@@ -223,14 +232,43 @@ export class TccDBusInterface extends dbus.interface.Interface {
     // biome-ignore lint: function is never read because of dbus
     private SetTempProfile(profileName: string): boolean {
         this.data.tempProfileName = profileName;
+        this.data.manualProfileOverrideTs = Date.now();
         return true;
     }
 
     // biome-ignore lint: function is never read because of dbus
     private SetTempProfileById(id: string): boolean {
         this.data.tempProfileId = id;
+        this.data.manualProfileOverrideTs = Date.now();
         this.interfaceOptions.triggerStateCheck();
         return true;
+    }
+
+    // biome-ignore lint: function is never read because of dbus
+    private GetAutopilotStatusJSON(): string {
+        return this.data.autopilotStatusJSON;
+    }
+
+    // biome-ignore lint: function is never read because of dbus
+    private GetAquarisAutoTargetJSON(): string {
+        return this.data.aquarisAutoTargetJSON;
+    }
+
+    // biome-ignore lint: function is never read because of dbus
+    private SetAutopilotEnabled(enabled: boolean): boolean {
+        if (this.interfaceOptions.setAutopilotEnabled === undefined) {
+            return false;
+        }
+        this.interfaceOptions.setAutopilotEnabled(enabled);
+        return true;
+    }
+
+    // biome-ignore lint: function is never read because of dbus
+    private SetAutopilotSettingsJSON(settingsJSON: string): boolean {
+        if (this.interfaceOptions.setAutopilotSettings === undefined) {
+            return false;
+        }
+        return this.interfaceOptions.setAutopilotSettings(settingsJSON);
     }
 
     // biome-ignore lint: function is never read because of dbus
@@ -433,6 +471,10 @@ TccDBusInterface.configureMembers({
         GetActiveProfileJSON: { outSignature: 's' },
         SetTempProfile: { inSignature: 's', outSignature: 'b' },
         SetTempProfileById: { inSignature: 's', outSignature: 'b' },
+        GetAutopilotStatusJSON: { outSignature: 's' },
+        GetAquarisAutoTargetJSON: { outSignature: 's' },
+        SetAutopilotEnabled: { inSignature: 'b', outSignature: 'b' },
+        SetAutopilotSettingsJSON: { inSignature: 's', outSignature: 'b' },
         GetProfilesJSON: { outSignature: 's' },
         GetCustomProfilesJSON: { outSignature: 's' },
         GetDefaultProfilesJSON: { outSignature: 's' },

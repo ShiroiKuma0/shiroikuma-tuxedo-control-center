@@ -26,3 +26,8 @@ rm /etc/udev/rules.d/99-webcam.rules || true
 
 # Delete the link to the binary
 rm -f '/usr/bin/tuxedo-control-center'
+
+# Remove the CLI front-end symlinks ($t without braces: electron-builder macro-expands this script)
+for t in tcc tccinfo tccprofile tccaquaris tccauto; do
+    rm -f "/usr/bin/$t" || true
+done

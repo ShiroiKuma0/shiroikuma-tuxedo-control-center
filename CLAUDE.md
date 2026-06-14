@@ -111,6 +111,55 @@ low-churn. The display label `白い熊 TUXEDO Control Center` lives only in the
   `SetTempProfileById` push (outside this repo), which becomes a harmless no-op once this ships but
   keeps the wrapper correct against an older `tccd`. (Diagnosed 2026-06-08.)
 
+### Autopilot — load-reactive auto profile + Aquaris cooling (preserve on rebase)
+
+A fork feature (no new daemon): a load-reactive "autopilot" lives **inside `tccd`** as a new worker,
+because `tccd` already boots, holds the profiles in memory, switches profiles in-process, and polls
+every signal needed. It switches between a high-load profile and a rest profile, and computes a
+desired Aquaris fan target. The daemon **cannot** do BLE (no `node-ble`, runs as root), so per the
+chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-Bus and the user-level
+**keeper** (which already holds the BLE link) applies it.
+
+- **`src/service-app/classes/AutoProfileWorker.ts`** (new, 1 s tick). Signals: CPU utilisation (new
+  `/proc/stat` reader), CPU package power (`cpuPowerValuesJSON` ÷ RAPL max), GPU load
+  (`{i,d}GpuInfoValuesJSON` power-or-freq), temps + internal fan % (`fanData`). Fast attack / slow
+  release (`releaseSec`) hysteresis. Holds `dbusData.sensorDataCollectionStatus = true` so RAPL/GPU
+  keep sampling headless. Switches by setting `dbusData.tempProfileId` + `triggerStateCheck()` —
+  mirrors `SetTempProfileById` **without** the D-Bus entry, so it doesn't trip its own pause.
+- **Manual-pick pause:** `SetTempProfile`/`SetTempProfileById` in `TccDBusInterface.ts` stamp
+  `dbusData.manualProfileOverrideTs = Date.now()` (the only seam that marks a *human* pick — GUI click
+  and `tccprofile` both hit these). The worker pauses profile control when it sees a newer stamp;
+  resumes on `SetAutopilotEnabled(true)` or after `resumeAfterSec`. Aquaris tracking continues while paused.
+- **Signals & decision:** raw signals drive *attack* (instant → high), EMA-smoothed signals
+  (`emaAlpha`) drive *release* (so a single-tick blip — e.g. a dGPU that reports ~0.3 clock-ratio when
+  it briefly wakes — can't keep it out of rest). Lows sit above idle noise.
+- **Aquaris tracks the internal (PC) fan %:** `computeAquarisTarget` maps PC-fan → Aquaris linearly
+  (`aquarisPcFanMin..aquarisPcFanMax` ⇒ `0..aquarisFanMax`; defaults 50..100 ⇒ 0..100, i.e. ~10%
+  Aquaris per 5% PC-fan), **off at/below `aquarisPcFanMin`** (50%). So the Aquaris winds *down with*
+  the laptop fan rather than cutting from 100→off.
+- **Rest is gated on cool-down, not just idle:** the profile drops to rest only when load is gone
+  (`cool`, EMA) **and** the PC fan has wound past `aquarisPcFanMin` (`cooled`) — `restReady = cool &&
+  cooled` — held for `releaseSec`. So profile #1 holds while the laptop is still actively cooling, and
+  #3 engages only after the Aquaris has already switched off.
+- **Settings:** `IAutopilotSettings` + `defaultAutopilotSettings` in `src/common/models/TccSettings.ts`,
+  added as optional `autopilot` on `ITccSettings` and to the default-settings objects. The daemon's
+  `readOrCreateConfigurationFiles()` forward-fills it (merge defaults); SIGHUP reload picks up edits.
+  Defaults are deliberately aggressive. `highLoadProfileId`/`restProfileId` default empty ⇒ the worker
+  uses profiles #1 and #3 of `GetProfilesJSON` (the order `tccprofile` shows).
+- **D-Bus** (`TccDBusInterface.ts` + wired via `TccDBusOptions` in `TccDBusService.ts`):
+  `GetAutopilotStatusJSON`, `GetAquarisAutoTargetJSON`, `SetAutopilotEnabled(b)`,
+  `SetAutopilotSettingsJSON(s)`. Daemon methods `setAutopilotEnabled` / `setAutopilotSettingsJSON` /
+  `persistAutopilotSettings` (writes `/etc/tcc/settings`). Blanket `com.tuxedocomputers.tccd.conf`
+  policy means these are callable unprivileged — no policy change.
+- **Keeper** (`src/e-app/AquarisLink.ts`): `AquarisDesired.auto` flag; when set, `tick()` reads
+  `GetAquarisAutoTargetJSON` over the **system bus** via a minimal `dbus-next` proxy (NOT
+  `TccDBusController` — its `init()` calls `app.exit()`, and `app` is undefined under
+  `ELECTRON_RUN_AS_NODE` in the keeper) and overrides the fan fields (LED/pump stay manual). D-Bus
+  error ⇒ fall back to the file's fan values.
+- **CLI** (packaged — see the `tools/` section below): **`tccauto`** (status / `on` / `off` / `high N` /
+  `rest N` / `set KEY VALUE` / `keys`) and **`tccaquaris auto on|off`**. `tcc` shows the live Aquaris
+  state from the keeper's `status.json` `.applied.*`.
+
 ### Versioning & .deb naming
 
 - `version` tracks upstream (currently `3.0.6`), kept clean.
@@ -162,19 +211,27 @@ profile; `SetTempProfile*` is temporary, reverts on AC/battery change — persis
 Aquaris (fan / LED / pump) is GUI + Bluetooth-only (`src/e-app/LCT21001.ts`,
 `src/e-app/backendAPIs/aquarisAPI.ts`) and is **not** on D-Bus, so it needs the GUI running.
 
-### `tools/` — headless CLI wrappers (canonical copies)
+### `tools/` — headless CLI wrappers (packaged into the .deb)
 
-`tools/` holds 白い熊's CLI wrappers around the above; the **live** copies run from `~/0/bin`
-(on PATH) — after editing, sync both locations. Not packaged into the .deb.
+`tools/` holds 白い熊's CLI wrappers around the above. They are **packaged**: `electron-builder.ts`
+ships them as `extraResources` (→ `/opt/shiroikuma-tuxedo-control-center/resources/tools/`) and
+`after_install.sh` symlinks each onto PATH at `/usr/bin/<tool>` (`after_remove.sh` deletes the
+symlinks). `tools/` is the canonical (and only) source — they are **no longer** kept in `~/0/bin`.
+Each script resolves siblings via `dirname "$(readlink -f "$0")"`, so the `/usr/bin` symlinks find
+each other in `resources/tools`.
 
 - `tcc` — interactive 3-column live monitor (dashboard | profiles | Aquaris), 1 s refresh, last
   frame stays on quit. Keys: `q` quit, `1`-`9` / `p` switch profile, `a` Aquaris cooling toggle,
-  `f` fan % (Enter sets), `l` LED toggle.
+  `f` fan % (Enter sets), `l` LED toggle. **Aquaris panel reflects the keeper's `status.json`
+  `.applied.*` (what's actually on the device, incl. autopilot-driven), with a `Mode: auto/manual`
+  line — not the `desired.json` wish (which is why it used to show "off" while running).**
 - `tccinfo [-m]` — the dashboard readings, one-shot or live (`-m`).
 - `tccprofile [N]` — list profiles / persistently switch (stateMap write via `sudo tccd
   --new_settings` + `SetTempProfileById` push).
 - `tccaquaris` — Aquaris control by editing `~/.config/tccaquaris/desired.json`, applied by
-  whoever holds the BLE link (keeper service or GUI).
+  whoever holds the BLE link (keeper service or GUI). `auto on|off` toggles autopilot fan-follow;
+  a manual `on`/`off`/`fan` command sets `auto=false` so the manual choice sticks.
+- `tccauto` — autopilot control (status / `on` / `off` / `high N` / `rest N` / `set KEY VALUE` / `keys`).
 
 **Candidate `custom`-branch feature (the payoff of owning this fork):** expose Aquaris on the daemon's
 D-Bus interface — e.g. `AquarisConnect` / `AquarisDisconnect` / `AquarisSetFan(i)` / `AquarisSetLed(s)`

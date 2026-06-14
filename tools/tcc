@@ -153,27 +153,43 @@ render_profiles() {
 }
 
 render_aquaris() {
-    local fanOn ledOn fan r g b link owner conn
-    fanOn=$(jq -r '.fanOn  // false' "$AQ_DESIRED" 2>/dev/null)
-    ledOn=$(jq -r '.ledOn  // false' "$AQ_DESIRED" 2>/dev/null)
-    fan=$(  jq -r '.fanDutyCycle // "?"' "$AQ_DESIRED" 2>/dev/null)
-    r=$(jq -r '.red // 0' "$AQ_DESIRED" 2>/dev/null)
-    g=$(jq -r '.green // 0' "$AQ_DESIRED" 2>/dev/null)
-    b=$(jq -r '.blue // 0' "$AQ_DESIRED" 2>/dev/null)
+    local fanOn ledOn fan r g b link owner conn auto
+    owner=$(jq -r '.owner // empty'     "$AQ_STATUS" 2>/dev/null)
+    conn=$( jq -r '.connected // false' "$AQ_STATUS" 2>/dev/null)
 
     if systemctl --user is-active --quiet "$AQ_SVC" 2>/dev/null; then
-        owner=$(jq -r '.owner // empty'     "$AQ_STATUS" 2>/dev/null)
-        conn=$( jq -r '.connected // false' "$AQ_STATUS" 2>/dev/null)
-        if [ "$owner" = "gui" ]; then link='held by GUI'
-        elif [ "$conn" = "true" ]; then link='keeper (held)'
-        else link='keeper: no device'
+        if   [ "$owner" = "gui" ];  then link='held by GUI'
+        elif [ "$conn"  = "true" ]; then link='keeper (held)'
+        else                             link='keeper: no device'
         fi
     else
         link='keeper stopped'
     fi
 
+    # Reflect what is ACTUALLY on the device — the keeper's last-applied state
+    # from status.json (this is what tccd's autopilot drives, via the keeper).
+    # Fall back to the desired file only when the keeper isn't connected.
+    if [ "$conn" = "true" ]; then
+        fanOn=$(jq -r '.applied.fanOn // false'      "$AQ_STATUS" 2>/dev/null)
+        fan=$(  jq -r '.applied.fanDutyCycle // "?"' "$AQ_STATUS" 2>/dev/null)
+        ledOn=$(jq -r '.applied.ledOn // false'      "$AQ_STATUS" 2>/dev/null)
+        r=$(jq -r '.applied.red // 0'   "$AQ_STATUS" 2>/dev/null)
+        g=$(jq -r '.applied.green // 0' "$AQ_STATUS" 2>/dev/null)
+        b=$(jq -r '.applied.blue // 0'  "$AQ_STATUS" 2>/dev/null)
+        auto=$(jq -r '.applied.auto // false' "$AQ_STATUS" 2>/dev/null)
+    else
+        fanOn=$(jq -r '.fanOn // false' "$AQ_DESIRED" 2>/dev/null)
+        fan=$(  jq -r '.fanDutyCycle // "?"' "$AQ_DESIRED" 2>/dev/null)
+        ledOn=$(jq -r '.ledOn // false' "$AQ_DESIRED" 2>/dev/null)
+        r=$(jq -r '.red // 0' "$AQ_DESIRED" 2>/dev/null)
+        g=$(jq -r '.green // 0' "$AQ_DESIRED" 2>/dev/null)
+        b=$(jq -r '.blue // 0' "$AQ_DESIRED" 2>/dev/null)
+        auto=$(jq -r '.auto // false' "$AQ_DESIRED" 2>/dev/null)
+    fi
+
     printf 'Aquaris\n\n'
     printf 'Link    : %s\n' "$link"
+    if [ "$auto" = "true" ]; then printf 'Mode    : auto (tccd)\n'; else printf 'Mode    : manual\n'; fi
     if [ "$fanOn" = "true" ]; then
         printf 'Cooling : ON\n'
     else
@@ -279,7 +295,15 @@ prompt_fan() {
 }
 
 aq_toggle_cooling() {
-    if [ "$(jq -r '.fanOn // false' "$AQ_DESIRED" 2>/dev/null)" = "true" ]; then
+    # Toggle relative to the ACTUAL running state (a manual toggle takes over
+    # from the autopilot — tccaquaris on/off clears the auto-follow flag).
+    local on
+    if [ "$(jq -r '.connected // false' "$AQ_STATUS" 2>/dev/null)" = "true" ]; then
+        on=$(jq -r '.applied.fanOn // false' "$AQ_STATUS" 2>/dev/null)
+    else
+        on=$(jq -r '.fanOn // false' "$AQ_DESIRED" 2>/dev/null)
+    fi
+    if [ "$on" = "true" ]; then
         "$SELF_DIR/tccaquaris" off >/dev/null 2>&1
     else
         "$SELF_DIR/tccaquaris" on >/dev/null 2>&1

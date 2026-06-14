@@ -43,6 +43,12 @@ export class TccDBusService extends DaemonWorker {
             this.tccd.triggerStateCheck();
         };
         options.chargingWorker = this.tccd.getChargingWorker();
+        options.setAutopilotEnabled = (enabled: boolean): void => {
+            this.tccd.setAutopilotEnabled(enabled);
+        };
+        options.setAutopilotSettings = (settingsJSON: string): boolean => {
+            return this.tccd.setAutopilotSettingsJSON(settingsJSON);
+        };
 
         try {
             this.bus = dbus.systemBus();

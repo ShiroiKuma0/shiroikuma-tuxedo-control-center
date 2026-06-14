@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+#
+# tccauto — control the tccd "autopilot": load-reactive profile switching plus
+# an Aquaris cooling target. All state lives in the daemon (settings.autopilot,
+# persisted to /etc/tcc/settings and reloaded live); this just talks to it over
+# the system D-Bus, so no sudo is needed.
+#
+#   tccauto                 show status (live load signals + config)
+#   tccauto on | off        enable / disable the autopilot
+#   tccauto high N          use profile #N (as 'tccprofile' lists) under load
+#   tccauto rest N          use profile #N at rest
+#   tccauto set KEY VALUE   set a tunable (e.g. cpuUtilHigh 0.3, tempHigh 65,
+#                           releaseSec 30, aquarisEnabled false)
+#   tccauto keys            list tunable keys with their current values
+#
+# A manual profile pick (GUI or 'tccprofile') pauses the autopilot so the choice
+# sticks; "tccauto on" resumes it (it also auto-resumes after resumeAfterSec).
+#
+set -uo pipefail
+
+BUS=com.tuxedocomputers.tccd
+OBJ=/com/tuxedocomputers/tccd
+
+die() { printf 'tccauto: %s\n' "$*" >&2; exit 1; }
+command -v busctl >/dev/null || die "busctl not found"
+command -v jq     >/dev/null || die "jq not found"
+
+# call a method returning a single value; print raw .data[0]
+dj() { busctl --json=short --system call "$BUS" "$OBJ" "$BUS" "$@" 2>/dev/null | jq -r '.data[0]'; }
+
+busctl --system call "$BUS" "$OBJ" "$BUS" dbusAvailable >/dev/null 2>&1 \
+    || die "tccd not reachable on the system bus (is the daemon running?)"
+
+settings_autopilot() { dj GetSettingsJSON | jq '.autopilot // {}'; }
+profiles() { dj GetProfilesJSON; }
+profile_name_by_id() { profiles | jq -r --arg id "$1" '.[] | select(.id==$id) | .name' | head -1; }
+
+profile_id_by_index() { # $1 = 1-based index, like tccprofile
+    local n="$1" p count
+    p=$(profiles); count=$(printf '%s' "$p" | jq 'length')
+    { [ "$n" -ge 1 ] && [ "$n" -le "$count" ]; } || die "no profile #$n (have 1..$count)"
+    printf '%s' "$p" | jq -r ".[$((n-1))].id"
+}
+
+set_json() { # $1 = compact JSON object merged into settings.autopilot
+    local ok
+    ok=$(busctl --json=short --system call "$BUS" "$OBJ" "$BUS" SetAutopilotSettingsJSON s "$1" 2>/dev/null \
+        | jq -r '.data[0]')
+    [ "$ok" = "true" ] || die "daemon rejected settings update"
+}
+
+pct() { awk -v x="${1:-}" 'BEGIN{ if (x=="" || x+0<0) print "  ?"; else printf "%3.0f%%", x*100 }'; }
+
+show() {
+    local s en pa dec aname hi re
+    s=$(dj GetAutopilotStatusJSON)
+    en=$(printf '%s' "$s" | jq -r '.enabled // false')
+    pa=$(printf '%s' "$s" | jq -r '.paused // false')
+    dec=$(printf '%s' "$s" | jq -r '.decision // "?"')
+    aname=$(printf '%s' "$s" | jq -r '.activeProfileName // "?"')
+
+    printf '\n  Autopilot\n\n'
+    if [ "$en" = "true" ]; then
+        if [ "$pa" = "true" ]; then
+            printf '  State   : ON  (paused — a manual profile pick is active; "tccauto on" to resume)\n'
+        else
+            printf '  State   : ON\n'
+        fi
+    else
+        printf '  State   : off  ("tccauto on" to enable)\n'
+    fi
+    printf '  Active  : %s   (decision: %s)\n' "$aname" "$dec"
+
+    local u pw gl mt fan
+    u=$(printf  '%s' "$s" | jq -r '.signals.cpuUtil // empty')
+    pw=$(printf '%s' "$s" | jq -r '.signals.cpuPowerFrac // empty')
+    gl=$(printf '%s' "$s" | jq -r '.signals.gpuLoad // empty')
+    mt=$(printf '%s' "$s" | jq -r '.signals.maxTemp // empty'); [ "$mt" = "-1" ] && mt="?"
+    fan=$(printf '%s' "$s" | jq -r '.signals.internalFan // empty'); [ "$fan" = "-1" ] && fan="?"
+    printf '  Load    : cpu %s  power %s  gpu %s   temp %s°C  fan %s%%\n' \
+        "$(pct "$u")" "$(pct "$pw")" "$(pct "$gl")" "${mt:-?}" "${fan:-?}"
+
+    local aen afon afan
+    aen=$(printf  '%s' "$s" | jq -r '.aquaris.enabled // false')
+    afon=$(printf '%s' "$s" | jq -r '.aquaris.fanOn // false')
+    afan=$(printf '%s' "$s" | jq -r '.aquaris.fanDutyCycle // 0')
+    if [ "$aen" = "true" ]; then
+        printf '  Aquaris : target fan %s%% (%s)   — needs the keeper + "tccaquaris auto on"\n' \
+            "$afan" "$([ "$afon" = true ] && echo on || echo off)"
+    else
+        printf '  Aquaris : auto off\n'
+    fi
+
+    hi=$(printf '%s' "$s" | jq -r '.highLoadProfileId // empty')
+    re=$(printf '%s' "$s" | jq -r '.restProfileId // empty')
+    printf '  Profiles: high → %s   rest → %s\n\n' "$(profile_name_by_id "$hi")" "$(profile_name_by_id "$re")"
+}
+
+keys() {
+    printf '\n  Autopilot tunables (current values)\n\n'
+    settings_autopilot | jq -r 'to_entries[] | "  \(.key) = \(.value)"'
+    printf '\n'
+}
+
+cmd="${1:-}"
+case "$cmd" in
+    ''|status|show) show ;;
+
+    on)  [ "$(dj SetAutopilotEnabled b true)"  = true ] || die "failed to enable";  printf '  autopilot ON\n';  show ;;
+    off) [ "$(dj SetAutopilotEnabled b false)" = true ] || die "failed to disable"; printf '  autopilot off\n'; show ;;
+
+    high|rest)
+        n="${2:-}"; case "$n" in ''|*[!0-9]*) die "usage: tccauto $cmd <profile-number>  (run 'tccprofile' to see the list)";; esac
+        id=$(profile_id_by_index "$n")
+        key=$([ "$cmd" = high ] && echo highLoadProfileId || echo restProfileId)
+        set_json "$(jq -nc --arg k "$key" --arg v "$id" '{($k):$v}')"
+        printf '  %s profile → #%s (%s)\n' "$cmd" "$n" "$(profile_name_by_id "$id")"
+        show ;;
+
+    set)
+        k="${2:-}"; v="${3:-}"
+        { [ -n "$k" ] && [ $# -ge 3 ]; } || die "usage: tccauto set <key> <value>  (run 'tccauto keys')"
+        case "$v" in
+            true|false)        j=$(jq -nc --arg k "$k" --argjson v "$v" '{($k):$v}') ;;
+            ''|*[!0-9.+-]*)    j=$(jq -nc --arg k "$k" --arg     v "$v" '{($k):$v}') ;;  # string
+            *)                 j=$(jq -nc --arg k "$k" --argjson v "$v" '{($k):$v}') ;;  # number
+        esac
+        set_json "$j"
+        printf '  set %s = %s\n' "$k" "$v"
+        keys ;;
+
+    keys|list) keys ;;
+
+    -h|--help|help) awk 'NR==1{next} /^#/{sub(/^# ?/,"");print;next} {exit}' "$0" ;;
+
+    *) die "unknown command: $cmd  (try: tccauto --help)" ;;
+esac

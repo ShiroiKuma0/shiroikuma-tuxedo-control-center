@@ -86,6 +86,13 @@ async function buildDeb(filenameAddition: string): Promise<void> {
             `${distSrc}/data/dist-data/99-webcam.rules`,
             `${distSrc}/data/dist-data/com.tuxedocomputers.tomte.policy`,
             `${distSrc}/data/camera/v4l2_kernel_names.json`,
+            // Headless CLI front-ends → /opt/.../resources/tools, symlinked onto
+            // PATH by after_install.sh (tcc, tccinfo, tccprofile, tccaquaris, tccauto).
+            './tools/tcc',
+            './tools/tccinfo',
+            './tools/tccprofile',
+            './tools/tccaquaris',
+            './tools/tccauto',
         ],
         // Fork build (npm run pack-fork) sets TCC_FORK_VERSION=<base>+<N>. extraMetadata
         // keeps the +N verbatim in the .deb Version and app.getVersion() (a plain
@@ -165,6 +172,11 @@ async function buildRpm(filenameAddition: string): Promise<void> {
             `${distSrc}/data/camera/cameractrls.py`,
             `${distSrc}/data/camera/v4l2_kernel_names.json`,
             `${distSrc}/data/dist-data/99-webcam.rules`,
+            './tools/tcc',
+            './tools/tccinfo',
+            './tools/tccprofile',
+            './tools/tccaquaris',
+            './tools/tccauto',
         ],
         linux: {
             target: ['rpm'],

@@ -35,6 +35,18 @@ loginctl enable-linger shiroikuma || true
 mv ${DIST_DATA}/99-webcam.rules /etc/udev/rules.d/99-webcam.rules
 udevadm control --reload-rules && udevadm trigger
 
+# Headless CLI front-ends — symlink onto PATH (canonical copies live in resources/tools).
+# NB: loop var is referenced as $t (no braces) on purpose — electron-builder
+# macro-expands this whole install script, and a lowercase brace-token would be
+# read as an undefined macro and abort the build (UPPER_SNAKE names are ignored).
+TOOLS_DIR=/opt/shiroikuma-tuxedo-control-center/resources/tools
+for t in tcc tccinfo tccprofile tccaquaris tccauto; do
+    if [ -f "$TOOLS_DIR/$t" ]; then
+        chmod 0755 "$TOOLS_DIR/$t" || true
+        ln -sf "$TOOLS_DIR/$t" "/usr/bin/$t" || true
+    fi
+done
+
 # ---
 # Original electron-builder after-install.tpl
 # ---

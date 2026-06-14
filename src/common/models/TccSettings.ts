@@ -46,6 +46,71 @@ export interface KeyboardBacklightStateInterface {
     blue: number;
 }
 
+/**
+ * Autopilot (fork addition) — load-reactive auto profile switching + Aquaris
+ * cooling target. Tunables persist in /etc/tcc/settings (reloaded on SIGHUP);
+ * the daemon-side AutoProfileWorker reads them every tick. Defaults are
+ * deliberately aggressive (react before things get hot); adjust via the
+ * `tccauto` CLI / the SetAutopilot* D-Bus methods.
+ */
+export interface IAutopilotSettings {
+    /** Master switch — on at boot. */
+    enabled: boolean;
+    /** Profile applied under load. Empty => profile #1 in the GetProfilesJSON order. */
+    highLoadProfileId: string;
+    /** Profile applied at rest. Empty => profile #3 in the GetProfilesJSON order. */
+    restProfileId: string;
+    /** CPU utilisation (0..1, from /proc/stat) thresholds. */
+    cpuUtilHigh: number;
+    cpuUtilLow: number;
+    /** CPU package power as a fraction (0..1) of the RAPL max limit. */
+    cpuPowerHigh: number;
+    cpuPowerLow: number;
+    /** GPU load (0..1, power- or frequency-derived) thresholds. */
+    gpuLoadHigh: number;
+    gpuLoadLow: number;
+    /** Any sensor at/above this °C forces the high-load profile. */
+    tempHigh: number;
+    /** EMA smoothing factor (0..1) for the *release* signals — higher = snappier, lower = steadier. */
+    emaAlpha: number;
+    /** Seconds the system must stay below the *Low thresholds before dropping to rest. */
+    releaseSec: number;
+    /** Seconds after a manual profile pick before the autopilot resumes (0 = stay paused until re-enabled). */
+    resumeAfterSec: number;
+    /** Aquaris fan auto-control on/off. */
+    aquarisEnabled: boolean;
+    /** Aquaris tracks the internal (PC) fan %: OFF at/below aquarisPcFanMin, then
+     *  scaling linearly to aquarisFanMax at aquarisPcFanMax. Defaults (50→100 PC
+     *  fan ⇒ 0→100 Aquaris) give ~10% Aquaris per 5% PC-fan change. */
+    aquarisPcFanMin: number;
+    aquarisPcFanMax: number;
+    aquarisFanMax: number;
+}
+
+export const defaultAutopilotSettings: IAutopilotSettings = {
+    enabled: true,
+    highLoadProfileId: '',
+    restProfileId: '',
+    // High thresholds = instant attack (on raw signals); Low thresholds = release
+    // (on smoothed signals). Lows sit above typical idle noise — incl. a dGPU that
+    // reports ~0.3 clock-ratio when it briefly wakes — so the system reliably
+    // settles to rest, while still reacting fast to real load.
+    cpuUtilHigh: 0.3,
+    cpuUtilLow: 0.15,
+    cpuPowerHigh: 0.45,
+    cpuPowerLow: 0.25,
+    gpuLoadHigh: 0.6,
+    gpuLoadLow: 0.4,
+    tempHigh: 75,
+    emaAlpha: 0.3,
+    releaseSec: 20,
+    resumeAfterSec: 1800,
+    aquarisEnabled: true,
+    aquarisPcFanMin: 50,
+    aquarisPcFanMax: 100,
+    aquarisFanMax: 100,
+};
+
 export interface ITccSettings {
     fahrenheit: boolean;
     stateMap: {
@@ -60,6 +125,7 @@ export interface ITccSettings {
     chargingProfile: string | null;
     chargingPriority: string | null;
     keyboardBacklightStates: Array<KeyboardBacklightStateInterface>;
+    autopilot?: IAutopilotSettings;
 }
 
 export const defaultSettings: ITccSettings = {
@@ -76,6 +142,7 @@ export const defaultSettings: ITccSettings = {
     chargingProfile: null,
     chargingPriority: null,
     keyboardBacklightStates: [],
+    autopilot: { ...defaultAutopilotSettings },
 };
 
 export const defaultSettingsXP1508UHD: ITccSettings = {
@@ -92,6 +159,7 @@ export const defaultSettingsXP1508UHD: ITccSettings = {
     chargingProfile: null,
     chargingPriority: null,
     keyboardBacklightStates: [],
+    autopilot: { ...defaultAutopilotSettings },
 };
 
 const defaultSettingsMobile: ITccSettings = {
@@ -108,6 +176,7 @@ const defaultSettingsMobile: ITccSettings = {
     chargingProfile: null,
     chargingPriority: null,
     keyboardBacklightStates: [],
+    autopilot: { ...defaultAutopilotSettings },
 };
 
 export const deviceCustomSettings: Map<TUXEDODevice, ITccSettings> = new Map();
