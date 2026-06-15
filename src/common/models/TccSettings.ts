@@ -79,11 +79,11 @@ export interface IAutopilotSettings {
     resumeAfterSec: number;
     /** Aquaris fan auto-control on/off. */
     aquarisEnabled: boolean;
-    /** Aquaris tracks the internal (PC) fan %: OFF at/below aquarisPcFanMin, then
-     *  scaling linearly to aquarisFanMax at aquarisPcFanMax. Defaults (50→100 PC
-     *  fan ⇒ 0→100 Aquaris) give ~10% Aquaris per 5% PC-fan change. */
+    /** Aquaris tracks the internal (PC) fan %: OFF at/below aquarisPcFanMin, else run
+     *  at (PC fan + aquarisFanOffset), clamped to aquarisFanMax. Defaults: off at/below
+     *  50% PC fan, otherwise +10% above it (so PC fan 90% ⇒ Aquaris 100%). */
     aquarisPcFanMin: number;
-    aquarisPcFanMax: number;
+    aquarisFanOffset: number;
     aquarisFanMax: number;
     /** Lead floor: while under load (the instant the attack triggers), apply at least
      *  this Aquaris % so it leads the laptop fan's spin-up. The PC-fan curve governs
@@ -108,10 +108,10 @@ export const defaultAutopilotSettings: IAutopilotSettings = {
     tempHigh: 75,
     emaAlpha: 0.3,
     releaseSec: 20,
-    resumeAfterSec: 1800,
+    resumeAfterSec: 300,
     aquarisEnabled: true,
     aquarisPcFanMin: 50,
-    aquarisPcFanMax: 100,
+    aquarisFanOffset: 10,
     aquarisFanMax: 100,
     aquarisLeadDuty: 50,
 };

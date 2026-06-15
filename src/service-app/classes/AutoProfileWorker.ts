@@ -307,12 +307,11 @@ export class AutoProfileWorker extends DaemonWorker {
         if (!cfg.aquarisEnabled) {
             return { enabled: false, fanOn: false, fanDutyCycle: 0 };
         }
-        // PC-fan curve: OFF at/below aquarisPcFanMin, scaling linearly to
-        // aquarisFanMax at aquarisPcFanMax (defaults 50→100 PC fan ⇒ 0→100 Aquaris,
-        // ~10% Aquaris per 5% PC-fan).
+        // PC-fan curve: OFF at/below aquarisPcFanMin, else run at the PC fan plus
+        // aquarisFanOffset, clamped to aquarisFanMax (defaults: off ≤50% PC fan,
+        // otherwise +10% above it, so PC fan 90% ⇒ Aquaris 100%).
         const pcFan: number = signals.internalFan;
-        const span: number = Math.max(1, cfg.aquarisPcFanMax - cfg.aquarisPcFanMin);
-        const pcDuty: number = pcFan < 0 ? 0 : clamp(((pcFan - cfg.aquarisPcFanMin) / span) * cfg.aquarisFanMax, 0, cfg.aquarisFanMax);
+        const pcDuty: number = pcFan > cfg.aquarisPcFanMin ? clamp(pcFan + cfg.aquarisFanOffset, 0, cfg.aquarisFanMax) : 0;
         // Lead the laptop fan's spin-up: while under load (`hot`), floor the duty at
         // aquarisLeadDuty so the Aquaris reacts immediately instead of waiting for the
         // PC fan to ramp. `hot` clears the instant load stops, so the wind-down/off
