@@ -23,15 +23,23 @@
  * ~/.config/tccaquaris/desired.json. Used by BOTH the GUI (role 'gui') and the
  * bundled keeper service (role 'keeper').
  *
- * Hand-off: the GUI heart-beats ~/.config/tccaquaris/owner.lock while it runs.
- * The keeper YIELDS (clean-disconnects, applies nothing) while that lock is
- * fresh, and re-acquires when it goes stale/absent (GUI exit/crash). Both apply
- * the same desired.json, so the tccaquaris CLI just edits that file.
+ * Ownership (keeper-authoritative): the KEEPER is the default owner — it
+ * heart-beats ~/.config/tccaquaris/owner.lock (owner='keeper') on a steady timer
+ * and NEVER yields to the GUI. The GUI is a hot standby: it only drives the
+ * device while the keeper's lock is stale/absent (keeper stopped/crashed), plus a
+ * short boot-race grace. Both apply the same desired.json (the tccaquaris CLI and
+ * the GUI controls just edit that file), so the GUI loses nothing by deferring —
+ * the keeper applies its changes within ~1.5 s.
  *
- * Clean disconnect (no LCT 'reset' frame) is used on yield/stop so the pump/fan
- * keep running through the brief hand-off gap. The device firmware lights the
- * LED blue while powered + unconnected, so a momentary blue blink during the
- * gap is unavoidable; the idle desired state is LED off.
+ * Rationale: the previous GUI-priority hand-off could deadlock — an autostarted
+ * tray GUI would grab the lock and, if it then couldn't connect to the device,
+ * hold the lock forever while the keeper yielded, leaving the Aquaris
+ * uncontrolled with nobody present. Keeper-authoritative cannot starve: a wedged
+ * GUI simply defers, and the keeper keeps (re)trying and owns status.json.
+ *
+ * Clean disconnect (no LCT 'reset' frame) is used on defer/stop so the pump/fan
+ * keep running through any brief gap. The device firmware lights the LED blue
+ * while powered + unconnected; the idle desired state is LED off.
  */
 
 import * as fs from 'node:fs';
@@ -81,6 +89,10 @@ const LOCK_FILE: string = path.join(CFG_DIR, 'owner.lock');
 
 const POLL_MS = 1500;
 const STALE_MS = 4000;
+// GUI defers to the keeper for this long after the GUI starts, so the keeper
+// (which autostarts at login too) wins the boot race and the GUI never grabs
+// the link out from under it.
+const STARTUP_GRACE_MS = 6000;
 
 const DEFAULT_DESIRED: AquarisDesired = {
     red: 0,
@@ -126,6 +138,7 @@ export class AquarisLink {
     private uartTx: NodeBle.GattCharacteristic | undefined;
 
     private applied: { led?: string; fan?: string; pump?: string } = {};
+    private startedAtMs = 0;
 
     // Autopilot (fork): lazy system-bus link to tccd for the auto fan target.
     private tccBus: dbus.MessageBus | undefined;
@@ -147,12 +160,16 @@ export class AquarisLink {
         } catch (_e: unknown) {
             /* ignore */
         }
-        // The GUI heart-beats the ownership lock on its OWN steady timer, decoupled
-        // from the (sometimes slow) BLE connect/apply loop — otherwise a slow connect
-        // could delay the heartbeat past STALE_MS and the keeper would wrongly take over.
-        if (this.role === 'gui') {
+        if (this.role === 'keeper') {
+            // The keeper is the authoritative owner: claim immediately and heart-beat
+            // the ownership lock on a steady 1 s timer, decoupled from the (sometimes
+            // slow) BLE connect/apply loop — so a slow connect can't let the lock go
+            // stale and let the GUI wrongly grab the link.
             this.writeLock();
             this.heartbeatTimer = setInterval((): void => this.writeLock(), 1000);
+        } else {
+            // GUI hot standby — record start for the boot-race grace.
+            this.startedAtMs = Date.now();
         }
         this.log(`AquarisLink starting (role=${this.role}, mac=${this.mac})`);
         void this.loop();
@@ -164,13 +181,9 @@ export class AquarisLink {
             clearInterval(this.heartbeatTimer);
             this.heartbeatTimer = undefined;
         }
-        if (this.role === 'gui') {
-            try {
-                fs.rmSync(LOCK_FILE, { force: true });
-            } catch (_e: unknown) {
-                /* ignore */
-            }
-        }
+        // Don't delete the lock here: the keeper's heartbeat simply stops, so the
+        // lock goes stale within STALE_MS and the GUI standby takes over — while a
+        // quick service *restart* (< STALE_MS) keeps the lock fresh and avoids churn.
         await this.disconnect('stop');
         try {
             this.destroyBt?.();
@@ -196,17 +209,23 @@ export class AquarisLink {
     }
 
     private async tick(): Promise<void> {
-        if (this.role === 'keeper' && this.guiHoldsLock()) {
-            // GUI owns the link — yield (and let the GUI own status.json).
-            if (!this.yielding) {
-                await this.disconnect('yield to GUI');
-                this.yielding = true;
-                this.writeStatus({ owner: 'gui', connected: false, note: 'GUI is taking the link', error: null });
+        // Keeper is authoritative and never yields. The GUI defers to a live keeper
+        // (fresh keeper lock) and for a short grace after its own start, so the
+        // keeper is never starved by a wedged/autostarted GUI.
+        if (this.role === 'gui') {
+            const inStartupGrace: boolean = Date.now() - this.startedAtMs < STARTUP_GRACE_MS;
+            if (inStartupGrace || this.keeperHoldsLock()) {
+                if (!this.yielding) {
+                    await this.disconnect('defer to keeper');
+                    this.yielding = true;
+                }
+                return; // leave status.json to the keeper
             }
-            return;
         }
         this.yielding = false;
-        // (GUI lock heartbeat runs on its own timer — see start())
+        if (this.role === 'keeper') {
+            this.writeLock(); // claim promptly; the steady heartbeat also maintains it
+        }
 
         const desired: AquarisDesired = this.readDesired();
         // Autopilot: let the daemon's fan target drive the fan (LED/pump stay manual).
@@ -244,24 +263,25 @@ export class AquarisLink {
         return null;
     }
 
-    // ---- ownership lock -----------------------------------------------------
-    private guiHoldsLock(): boolean {
+    // ---- ownership lock (keeper-authoritative) ------------------------------
+    /** True if a *live* keeper currently holds the lock (so the GUI must defer). */
+    private keeperHoldsLock(): boolean {
         const lock: OwnerLock | null = readJson<OwnerLock>(LOCK_FILE);
         if (!lock || typeof lock.ts !== 'number') {
             return false;
         }
-        if (Date.now() - lock.ts > STALE_MS) {
+        if (lock.owner !== 'keeper') {
             return false;
         }
         if (lock.pid === process.pid) {
             return false;
         }
-        return true;
+        return Date.now() - lock.ts <= STALE_MS;
     }
 
     private writeLock(): void {
         try {
-            fs.writeFileSync(LOCK_FILE, JSON.stringify({ owner: 'gui', pid: process.pid, ts: Date.now() } as OwnerLock));
+            fs.writeFileSync(LOCK_FILE, JSON.stringify({ owner: this.role, pid: process.pid, ts: Date.now() } as OwnerLock));
         } catch (_e: unknown) {
             /* ignore */
         }

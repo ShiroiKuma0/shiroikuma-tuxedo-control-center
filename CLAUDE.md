@@ -158,6 +158,14 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
   `TccDBusController` — its `init()` calls `app.exit()`, and `app` is undefined under
   `ELECTRON_RUN_AS_NODE` in the keeper) and overrides the fan fields (LED/pump stay manual). D-Bus
   error ⇒ fall back to the file's fan values.
+- **Ownership is keeper-authoritative** (`AquarisLink.ts`): the **keeper** heart-beats
+  `~/.config/tccaquaris/owner.lock` (`owner='keeper'`) and **never yields**; the **GUI** is a hot
+  standby that drives the device only while the keeper's lock is stale/absent (keeper down) plus a
+  boot-race grace (`STARTUP_GRACE_MS`). This **replaced** the earlier GUI-priority hand-off, which
+  could deadlock — an autostarted tray GUI grabbed the lock and, if it then couldn't connect, held it
+  forever while the keeper yielded, leaving the Aquaris uncontrolled with nobody present. The GUI
+  loses nothing by deferring: its controls and the `tccaquaris` CLI just edit `desired.json`, which
+  the keeper applies. (Diagnosed 2026-06-16.)
 - **CLI** (packaged — see the `tools/` section below): **`tccauto`** (status / `on` / `off` / `high N` /
   `rest N` / `set KEY VALUE` / `keys`) and **`tccaquaris auto on|off`**. `tcc` shows the live Aquaris
   state from the keeper's `status.json` `.applied.*`.
