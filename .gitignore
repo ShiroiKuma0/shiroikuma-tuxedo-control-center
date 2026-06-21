@@ -52,3 +52,4 @@ src/ng-app/assets/CHANGELOG.md
 
 # cache
 .angular/cache*
+.scratch/

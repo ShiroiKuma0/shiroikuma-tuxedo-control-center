@@ -1,103 +1,97 @@
-# TUXEDO Control Center
+<div align="center">
 
-The TUXEDO Control Center (short: TCC) gives TUXEDO laptop users full control over their hardware like CPU cores, fan speed and more. \
-To get a more detailed description of features, plans and the ideas behind please check our press release ([english](https://www.tuxedocomputers.com/en/Infos/News/Everything-under-control-with-the-TUXEDO-Control-Center.tuxedo) | [german](https://www.tuxedocomputers.com/de/Infos/News/Alles-unter-Kontrolle-mit-dem-TUXEDO-Control-Center_1.tuxedo)) and info pages ([english](https://www.tuxedocomputers.com/en/TUXEDO-Control-Center.tuxedo#) | [german](https://www.tuxedocomputers.com/de/TUXEDO-Control-Center.tuxedo)).
+<img src="src/dist-data/tuxedo-control-center_256.png" width="120" alt="白い熊 TUXEDO Control Center" />
 
-## Using it
+# 白い熊 TUXEDO Control Center
 
-There are pre-build packages available at our repositories. For details please have a look [over here](https://www.tuxedocomputers.com/en/Add-TUXEDO-software-package-sources.tuxedo).
+*Control your TUXEDO laptop — CPU, fans, power profiles & the Aquaris cooler.*
 
-Note: TCC depends on `tuxedo-drivers` for some core functionality like fan control.
+**A fork of [TUXEDO Control Center](https://github.com/tuxedocomputers/tuxedo-control-center) with major
+additions: a load-reactive autopilot in the daemon, headless Aquaris water-cooler control over
+Bluetooth, and a full set of D-Bus/SSH command-line tools.**
 
-## Project structure
+**📥 Latest release: [`3.0.6+25`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
 
+</div>
+
+---
+
+## Install (replaces the official package)
+
+This is a **replace-mode** fork: the `.deb` installs as `shiroikuma-tuxedo-control-center` to
+`/opt/shiroikuma-tuxedo-control-center` and declares `Conflicts/Replaces/Provides: tuxedo-control-center`,
+so `apt` cleanly **supersedes** any installed official TUXEDO Control Center — only one TCC runs at a
+time. It keeps upstream's `tccd` system daemon, the `com.tuxedocomputers.tccd` D-Bus name, the polkit
+actions and your `/etc/tcc/` configuration, so everything carries over.
+
+```bash
+sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+25.deb
 ```
-tuxedo-control-center
-|  README.md
-|--src
-|  |--ng-app            Angular GUI (aka electron renderer)
-|  |--e-app             Electron main
-|  |--service-app       Daemon part (Node 24)
-|  |--common            Common shared sources
-|  |  |--classes
-|  |  |--models
-|  |--dist-data         Data needed for packaging
-|--build-src            Source used for building
-```
 
-## Development setup
+Requires `tuxedo-drivers` (or `tuxedo-keyboard`), like upstream. The binary/command stays
+`tuxedo-control-center`; only the package, install path and display name are renamed.
 
-1. Install git, gcc, g++, make, nodejs, npm, libudev-dev and rpm \
-    Ex (deb):
-    ```
-    curl -sL https://deb.nodesource.com/setup_24.x | sudo -E bash -
+---
 
-    sudo apt install -y git gcc g++ make nodejs libudev-dev rpm
-    ```
-2. Clone & install libraries
-    ```
-    git clone https://github.com/tuxedocomputers/tuxedo-control-center
+## What this fork adds
 
-    cd tuxedo-control-center
+### 🌡️ Autopilot — load-reactive auto-tuning, built into `tccd`
 
-    npm clean-install
-    ```
+A new worker inside the privileged daemon watches the signals it already collects — CPU utilisation
+(`/proc/stat`), CPU package power (Intel RAPL), GPU load and temperatures — and **automatically switches
+between a high-load profile and a rest profile**. It attacks fast on real load and releases on a
+smoothed average, so a momentary blip can't flip it. A manual profile pick (in the GUI or via
+`tccprofile`) pauses the autopilot so your choice sticks, and it resumes after a few minutes. It's
+aggressive by default, fully tunable from the CLI, and persists across reboots.
 
-3. Install service file that points to development build path (or use installed service from packaged version)
-   
-   Manual instructions:
-   1. Copy `tccd.service` and `tccd-sleep.service` (from `<tcc folder>/src/dist-data`) to `/etc/systemd/system/`
-   2. Execute `npm run build` in `<tcc folder>`
-   3. Edit the `tccd.service` (exec start/stop) to point to `<tcc folder>/dist/tuxedo-control-center/data/service/tccd`
-   4. Copy `<tcc folder>/src/dist-data/com.tuxedocomputers.tccd.conf` to `/usr/share/dbus-1/system.d/`
-   5. Start service with `systemctl start tccd`
-   6. Enable autostart with `systemctl enable tccd tccd-sleep`
-   7. Execute `npm run start` in `<tcc folder>` to start the GUI
+### 💧 Headless Aquaris cooling
 
-### NPM scripts 
-`npm run <script-name>`
+The external **Aquaris** water-cooler (fan / LED / pump over Bluetooth LE) is GUI-only upstream. The fork
+adds a user-level **keeper** service that holds the BLE link headlessly — keeping the LED dark and
+continuously enforcing a desired state — so the Aquaris is controllable **over SSH and the CLI**, and
+driven by the autopilot. Ownership is **keeper-authoritative**: an autostarted tray GUI can never starve
+it and leave the cooler stranded. Under load the autopilot runs the Aquaris fan a step ahead of the
+laptop's own fan (off at rest, ramping as the system heats up, leading at load onset).
 
-| Script name                  | Description                                                 |
-| ---------------------------- | ----------------------------------------------------------- |
-| build-release (autoversion)  | Build and package release deb and rpm                       |
-| pack-prod all \| deb \| rpm  | Build and package release version for chosen target(s)      |
-| pack-debug all \| deb \| rpm | Build and package debug version for chosen target(s)        |
-| build-prod                   | Build service/electron/angular (release version)            |
-| build-debug                  | Build service/electron/angular (debug version)              |
-| start                        | Start electron app after build                              |
-| start-watch                  | Start with automatic reload on changes to angular directory |
-| tests                        | Run tests                                                   |
+### 🖥️ Headless control over D-Bus — a CLI toolkit
 
-### Debugging
-Debugging of electron main and render process is configured for vscode in .vscode/launch.json
+The daemon keeps upstream's `com.tuxedocomputers.tccd` D-Bus name, so the whole stack is controllable
+from a terminal or over SSH. The fork ships a set of wrappers, packaged into the `.deb` and symlinked
+onto your `PATH`:
 
-## Screenshots
-### English
+- **`tcc`** — a live 3-column terminal monitor (dashboard · profiles · Aquaris), refreshed every second.
+- **`tccinfo`** — one-shot or live dashboard readings (CPU/GPU temps, fans, power, clocks).
+- **`tccprofile`** — list profiles, or switch the active profile persistently.
+- **`tccaquaris`** — control the Aquaris (fan / LED / on-off) headlessly via the keeper.
+- **`tccauto`** — view and tune the autopilot (status, on/off, high/rest profiles, thresholds).
 
-<img src="screenshots/en/Systemmonitor_TCC.png" alt="Systemmonitor">
-<img src="screenshots/en/DarkTheme_TCC.png" alt="Dark Theme">
+### 🛡️ Daemon robustness
 
-<img src="screenshots/en/Tools_TCC.png" alt="Tools">
+- **No more D-Bus freezes.** The daemon's user-presence check ran `w` *synchronously* on its single
+  event loop; under a bloated process table that scan could take 20 s+ and freeze the entire D-Bus
+  interface (profile switching from the GUI and CLI would hang). It now runs asynchronously with a
+  timeout and an overlap guard.
+- **Reliable profile re-apply.** A settings reload now re-derives the active profile from the state map,
+  so `tccprofile` switching to an already-mapped profile actually applies instead of silently no-op'ing
+  behind a stale temporary override.
 
-<img src="screenshots/en/Mains_Battery_TCC.png" alt="">
+### 📦 Replace-mode packaging & identity
 
-<img src="screenshots/en/Profiles_TCC.png" alt="Profiles">
+Renamed package, `/opt` path and `白い熊 TUXEDO Control Center` display name, with the upstream daemon,
+D-Bus name, polkit actions and `/etc/tcc/` kept as shared singletons. The Electron runtime identity is
+pinned to upstream so the single-instance lock and window class stay correct, and the build stamps a
+monotonic `<base>+<N>` version so upgrades sort cleanly across upstream bumps.
 
-<img src="screenshots/en/Profile_Settings_TCC.png" alt="Profile Settings">
+### 🎨 Branding & UX
 
-<img src="screenshots/en/ControlCenter_TCC.png" alt="About">
+`白い熊 TUXEDO Control Center` window, tray and launcher labels, plus a dashboard fix that removes the
+permanent vertical scrollbar at startup so the dashboard fits the default window cleanly.
 
-### German
-<img src="screenshots/de/Systemmonitor_TCC.png" alt="Systemmonitor">
+---
 
-<img src="screenshots/de/DarkTheme_TCC.png" alt="Dark Theme">
+## Built on TUXEDO Control Center
 
-<img src="screenshots/de/Tools_TCC.png" alt="Tools">
-
-<img src="screenshots/de/Akku_Netz_TCC.png" alt="">
-
-<img src="screenshots/de/Profile_TCC.png" alt="Profile">
-
-<img src="screenshots/de/Profil_Einstellungen_TCC.png" alt="Profil Einstellungen">
-
-<img src="screenshots/de/ControlCenter_TCC.png" alt="">
+This is a personal fork of TUXEDO's
+[tuxedo-control-center](https://github.com/tuxedocomputers/tuxedo-control-center); all credit for the
+underlying application goes to TUXEDO Computers. It inherits TCC's **GPL-3.0** licence — see
+[`COPYING`](COPYING).
