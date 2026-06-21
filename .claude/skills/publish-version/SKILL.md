@@ -134,9 +134,11 @@ git push origin "<version>"
 
 # Release notes = this version's CHANGELOG.fork.md section. Use a LITERAL match (index($0,h)==1), NOT a
 # regex: the "+N" tail puts a "+" in the version, and "+" is a regex metachar, so /^## <version>/ would
-# fail to match. index() treats the header as a plain string.
+# fail to match. index() treats the header as a plain string. The trailing `awk 'NF{f=1} f'` strips the
+# leading blank line(s) after the header so the release body starts on real content.
 mkdir -p .scratch
-awk -v h="## <version>" 'index($0,h)==1{p=1;next} /^## /{if(p)exit} p' CHANGELOG.fork.md > .scratch/release-notes.md
+awk -v h="## <version>" 'index($0,h)==1{p=1;next} /^## /{if(p)exit} p' CHANGELOG.fork.md \
+  | awk 'NF{f=1} f' > .scratch/release-notes.md
 gh release create "<version>" \
   --repo ShiroiKuma0/shiroikuma-tuxedo-control-center \
   --title "白い熊 TUXEDO Control Center <version>" \
