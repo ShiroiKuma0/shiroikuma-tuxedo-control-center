@@ -105,7 +105,9 @@ const DEFAULT_DESIRED: AquarisDesired = {
     ledOn: false,
     fanOn: false,
     pumpOn: false,
-    auto: false,
+    // Default ON: a fresh/reset desired.json follows the tccd autopilot. A manual
+    // `tccaquaris on|off|fan` sets auto=false explicitly to take over; `auto on` resumes.
+    auto: true,
 };
 
 const TCCD_BUS_NAME = 'com.tuxedocomputers.tccd';

@@ -153,7 +153,9 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
   `SetAutopilotSettingsJSON(s)`. Daemon methods `setAutopilotEnabled` / `setAutopilotSettingsJSON` /
   `persistAutopilotSettings` (writes `/etc/tcc/settings`). Blanket `com.tuxedocomputers.tccd.conf`
   policy means these are callable unprivileged — no policy change.
-- **Keeper** (`src/e-app/AquarisLink.ts`): `AquarisDesired.auto` flag; when set, `tick()` reads
+- **Keeper** (`src/e-app/AquarisLink.ts`): `AquarisDesired.auto` flag (**defaults on** — a fresh/reset
+  `desired.json` follows the autopilot; a manual `tccaquaris on|off|fan` sets `auto=false` to take
+  over, `auto on` resumes); when set, `tick()` reads
   `GetAquarisAutoTargetJSON` over the **system bus** via a minimal `dbus-next` proxy (NOT
   `TccDBusController` — its `init()` calls `app.exit()`, and `app` is undefined under
   `ELECTRON_RUN_AS_NODE` in the keeper) and overrides the fan fields (LED/pump stay manual). D-Bus

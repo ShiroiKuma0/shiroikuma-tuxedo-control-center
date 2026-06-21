@@ -189,13 +189,21 @@ render_aquaris() {
 
     printf 'Aquaris\n\n'
     printf 'Link    : %s\n' "$link"
-    if [ "$auto" = "true" ]; then printf 'Mode    : auto (tccd)\n'; else printf 'Mode    : manual\n'; fi
+    if [ "$auto" = "true" ]; then
+        printf 'Mode    : auto\n'
+    else
+        printf 'Mode    : manual\n'
+        # Surface what the autopilot WOULD apply, so an off-but-wanted state is
+        # obvious (e.g. auto-follow was turned off but tccd wants the fan on).
+        local tw; tw=$(dj GetAquarisAutoTargetJSON 2>/dev/null | jq -r 'if (.enabled and .fanOn) then "auto wants \(.fanDutyCycle)%" else empty end' 2>/dev/null)
+        [ -n "$tw" ] && printf '%s\n' "$tw"
+    fi
+    # Fan % lives on the Cooling line so a stale "last level" never shows when off.
     if [ "$fanOn" = "true" ]; then
-        printf 'Cooling : ON\n'
+        printf 'Cooling : ON  (%s%%)\n' "$fan"
     else
         printf 'Cooling : off\n'
     fi
-    printf 'Fan     : %s %%\n' "$fan"
     if [ "$ledOn" = "true" ]; then
         printf 'LED     : on  RGB(%s,%s,%s)\n' "$r" "$g" "$b"
     else
