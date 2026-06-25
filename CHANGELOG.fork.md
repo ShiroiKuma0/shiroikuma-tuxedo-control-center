@@ -4,6 +4,24 @@ Release log for the fork-specific additions on top of
 [tuxedo-control-center](https://github.com/tuxedocomputers/tuxedo-control-center). Upstream's own
 changelog is in [`CHANGELOG.md`](CHANGELOG.md).
 
+## 3.0.6+26 — 2026-06-25
+
+Stability fix for the headless Aquaris keeper.
+
+### Aquaris / keeper — BLE link stability
+
+- **Stop Bluetooth discovery once connected.** The keeper started scanning to find the device but never
+  stopped, so the adapter kept *actively scanning while holding the connection* — the radio time-shares
+  scan windows with the link, which causes spurious disconnects. A disconnect would then wedge the
+  Aquaris firmware (the fan keeps running while the device stops advertising → unreachable, i.e. "stuck
+  on while reporting off", recoverable only by power-cycling the unit). The keeper now stops discovery
+  the moment it connects and only scans while actively searching for the device.
+- **Rebuild the node-ble stack on a dropped link.** Every reconnect re-fetched the GATT characteristic on
+  the same D-Bus connection, leaking an event listener each time (a `MaxListeners` warning and the keeper
+  growing to minutes of CPU). The keeper now tears the whole node-ble stack down and rebuilds it fresh on
+  a dropped link — once per drop, not per retry, so there is no churn during an outage — which also
+  recovers a wedged Bluetooth adapter.
+
 ## 3.0.6+25 — 2026-06-21
 
 First public release of the fork, built on upstream **TUXEDO Control Center 3.0.6**. Everything below is

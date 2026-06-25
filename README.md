@@ -10,7 +10,7 @@
 additions: a load-reactive autopilot in the daemon, headless Aquaris water-cooler control over
 Bluetooth, and a full set of D-Bus/SSH command-line tools.**
 
-**📥 Latest release: [`3.0.6+25`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
+**📥 Latest release: [`3.0.6+26`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
 
 </div>
 
@@ -25,7 +25,7 @@ time. It keeps upstream's `tccd` system daemon, the `com.tuxedocomputers.tccd` D
 actions and your `/etc/tcc/` configuration, so everything carries over.
 
 ```bash
-sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+25.deb
+sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+26.deb
 ```
 
 Requires `tuxedo-drivers` (or `tuxedo-keyboard`), like upstream. The binary/command stays
