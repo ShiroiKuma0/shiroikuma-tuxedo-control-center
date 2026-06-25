@@ -291,35 +291,45 @@ export class AquarisLink {
 
     // ---- BLE ----------------------------------------------------------------
     private async connect(): Promise<void> {
+        // Reuse a live connection.
         if (this.device !== undefined && this.uartTx !== undefined) {
             try {
                 if (await this.device.isConnected()) {
                     return;
                 }
             } catch (_e: unknown) {
-                /* reconnect below */
+                /* fall through and rebuild */
             }
         }
-        this.uartTx = undefined;
+        // Stale/dropped link: tear the whole node-ble stack down before rebuilding.
+        // Re-fetching the GATT characteristic on a reused dbus connection leaks a
+        // PropertiesChanged listener on every reconnect (the MaxListenersExceeded
+        // warning + ever-growing CPU); a full rebuild also recovers a wedged
+        // adapter. Done once per drop here — NOT on every "device absent" retry, so
+        // there's no churn during an outage.
+        if (this.device !== undefined || this.uartTx !== undefined) {
+            this.teardownBt();
+        }
         if (this.adapter === undefined) {
             const cb = createBluetooth();
             this.bluetooth = cb.bluetooth;
             this.destroyBt = cb.destroy;
             this.adapter = await this.bluetooth.defaultAdapter();
         }
-        try {
-            if (!(await this.adapter.isDiscovering())) {
-                await this.adapter.startDiscovery();
-            }
-        } catch (_e: unknown) {
-            /* ignore */
-        }
+        // Find the device, scanning ONLY until we have it.
         let dev: NodeBle.Device | undefined;
         for (let i = 0; i < 5; i++) {
             try {
                 dev = await this.adapter.getDevice(this.mac);
                 break;
             } catch (e: unknown) {
+                try {
+                    if (!(await this.adapter.isDiscovering())) {
+                        await this.adapter.startDiscovery();
+                    }
+                } catch (_e: unknown) {
+                    /* ignore */
+                }
                 if (i === 4) {
                     throw e;
                 }
@@ -331,6 +341,16 @@ export class AquarisLink {
         }
         this.device = dev;
         await this.device.connect();
+        // Stop scanning now that we're connected. Leaving discovery on makes the
+        // radio time-share scan windows with the link and is a prime cause of
+        // spurious disconnects (which in turn wedge the Aquaris firmware).
+        try {
+            if (await this.adapter.isDiscovering()) {
+                await this.adapter.stopDiscovery();
+            }
+        } catch (_e: unknown) {
+            /* ignore */
+        }
         const gatt: NodeBle.GattServer = await this.device.gatt();
         const service: NodeBle.GattService = await gatt.getPrimaryService(NORDIC_UART_SERVICE);
         this.uartTx = await service.getCharacteristic(NORDIC_UART_TX);
@@ -338,32 +358,43 @@ export class AquarisLink {
         this.log('acquired link; applying full state');
     }
 
-    private async disconnect(reason: string): Promise<void> {
-        if (this.device === undefined) {
-            return;
-        }
+    /** Fully release the node-ble stack so a later connect() rebuilds it fresh. */
+    private teardownBt(): void {
         try {
-            if (await this.device.isConnected()) {
-                await this.device.disconnect(); // clean — no reset frame
-                this.log(`released link (${reason})`);
-            }
+            this.destroyBt?.();
         } catch (_e: unknown) {
             /* ignore */
         }
+        this.bluetooth = undefined;
+        this.adapter = undefined;
+        this.destroyBt = undefined;
         this.device = undefined;
         this.uartTx = undefined;
         this.applied = {};
     }
 
+    private async disconnect(reason: string): Promise<void> {
+        if (this.device !== undefined) {
+            try {
+                if (await this.device.isConnected()) {
+                    await this.device.disconnect(); // clean — no reset frame
+                    this.log(`released link (${reason})`);
+                }
+            } catch (_e: unknown) {
+                /* ignore */
+            }
+        }
+        // Full teardown so the next connect rebuilds a fresh, listener-free stack.
+        this.teardownBt();
+    }
+
     private async dropIfDisconnected(): Promise<void> {
         try {
             if (this.device !== undefined && !(await this.device.isConnected())) {
-                this.device = undefined;
-                this.uartTx = undefined;
+                this.teardownBt();
             }
         } catch (_e: unknown) {
-            this.device = undefined;
-            this.uartTx = undefined;
+            this.teardownBt();
         }
     }
 

@@ -168,6 +168,16 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
   forever while the keeper yielded, leaving the Aquaris uncontrolled with nobody present. The GUI
   loses nothing by deferring: its controls and the `tccaquaris` CLI just edit `desired.json`, which
   the keeper applies. (Diagnosed 2026-06-16.)
+- **BLE link stability** (`AquarisLink.connect()`): discovery is **stopped once connected** (only scan
+  while searching) — leaving it on makes the radio time-share scan windows with the link and causes
+  spurious disconnects, which in turn wedge the Aquaris firmware (fan stuck on, device stops
+  advertising → unreachable → "stuck on, reporting off", recoverable only by power-cycling the unit).
+  And on a dropped link the whole node-ble stack is **torn down (`teardownBt`/`destroyBt`) before
+  reconnecting** — re-fetching the GATT characteristic on a reused dbus connection leaked a
+  `PropertiesChanged` listener every reconnect (MaxListenersExceeded + 4–6 min keeper CPU). Teardown
+  runs once per drop, not per "device absent" retry, so there's no churn during an outage. **Don't
+  restart the keeper while it's connected** — that drops a working link and can re-wedge the device.
+  (Diagnosed 2026-06-24.)
 - **CLI** (packaged — see the `tools/` section below): **`tccauto`** (status / `on` / `off` / `high N` /
   `rest N` / `set KEY VALUE` / `keys`) and **`tccaquaris auto on|off`**. `tcc` shows the live Aquaris
   state from the keeper's `status.json` `.applied.*`.
