@@ -65,12 +65,20 @@ export interface AquarisDesired {
     // Autopilot (fork): when true, the daemon's auto fan target overrides the
     // fan fields below (LED/pump stay user-controlled).
     auto?: boolean;
+    // Epoch ms of the last manual fan override (tccaquaris on/off/fan). While this
+    // is set and auto is false, the keeper re-arms auto=true once resumeAfterSec
+    // has lapsed, so a manual fan tweak reverts to the autopilot on its own.
+    // `tccaquaris auto off` clears it (explicit, indefinite manual).
+    manualFanTs?: number;
 }
 
 interface AquarisAutoTarget {
     enabled: boolean;
     fanOn: boolean;
     fanDutyCycle: number;
+    // Seconds a manual fan override persists before the keeper re-arms auto-follow
+    // (mirrors the daemon's resumeAfterSec). Absent => keeper uses DEFAULT_RESUME_SEC.
+    resumeAfterSec?: number;
 }
 
 interface OwnerLock {
@@ -93,6 +101,9 @@ const STALE_MS = 4000;
 // (which autostarts at login too) wins the boot race and the GUI never grabs
 // the link out from under it.
 const STARTUP_GRACE_MS = 6000;
+// Fallback for the manual-fan-override resume timeout when the daemon's
+// resumeAfterSec can't be read over D-Bus (matches defaultAutopilotSettings).
+const DEFAULT_RESUME_SEC = 300;
 
 const DEFAULT_DESIRED: AquarisDesired = {
     red: 0,
@@ -231,13 +242,26 @@ export class AquarisLink {
 
         const desired: AquarisDesired = this.readDesired();
         // Autopilot: let the daemon's fan target drive the fan (LED/pump stay manual).
-        // On any D-Bus error we keep the file's fan values (fail-safe).
-        if (desired.auto) {
-            const target: AquarisAutoTarget | null = await this.getAquarisAutoTarget();
-            if (target !== null && target.enabled) {
-                desired.fanOn = target.fanOn;
-                desired.fanDutyCycle = target.fanDutyCycle;
+        // On any D-Bus error we keep the file's fan values (fail-safe). A manual
+        // `tccaquaris on/off/fan` sets auto=false and stamps manualFanTs; here we
+        // re-arm auto-follow once that override has lapsed past resumeAfterSec, so a
+        // manual fan tweak reverts to the autopilot on its own (in lockstep with the
+        // daemon's profile pause). `tccaquaris auto off` clears manualFanTs, so an
+        // explicit "stay manual" persists until `tccaquaris auto on`.
+        const target: AquarisAutoTarget | null =
+            desired.auto === true || desired.manualFanTs !== undefined ? await this.getAquarisAutoTarget() : null;
+        if (desired.auto !== true && desired.manualFanTs !== undefined) {
+            const resumeSec: number = target?.resumeAfterSec ?? DEFAULT_RESUME_SEC;
+            if (resumeSec > 0 && Date.now() - desired.manualFanTs >= resumeSec * 1000) {
+                desired.auto = true;
+                desired.manualFanTs = undefined;
+                this.writeDesired(desired); // persist re-arm BEFORE the target override mutates fan fields
+                this.log('autopilot fan-follow re-armed (manual override lapsed)');
             }
+        }
+        if (desired.auto === true && target !== null && target.enabled) {
+            desired.fanOn = target.fanOn;
+            desired.fanDutyCycle = target.fanDutyCycle;
         }
         await this.connect(); // retries internally; throws if device busy/absent (caught by loop)
         await this.applyDesired(desired);
@@ -257,7 +281,12 @@ export class AquarisLink {
             const json: string = await this.tccIface.GetAquarisAutoTargetJSON();
             const t = JSON.parse(json);
             if (typeof t?.fanDutyCycle === 'number') {
-                return { enabled: !!t.enabled, fanOn: !!t.fanOn, fanDutyCycle: t.fanDutyCycle };
+                return {
+                    enabled: !!t.enabled,
+                    fanOn: !!t.fanOn,
+                    fanDutyCycle: t.fanDutyCycle,
+                    resumeAfterSec: typeof t.resumeAfterSec === 'number' ? t.resumeAfterSec : undefined,
+                };
             }
         } catch (_e: unknown) {
             this.tccIface = undefined; // force reconnect next time
@@ -450,6 +479,18 @@ export class AquarisLink {
     // ---- files --------------------------------------------------------------
     private readDesired(): AquarisDesired {
         return { ...DEFAULT_DESIRED, ...(readJson<Partial<AquarisDesired>>(DESIRED_FILE) ?? {}) };
+    }
+
+    /** Persist desired.json (keeper re-arm of auto-follow). Atomic via tmp+rename;
+     *  undefined fields (e.g. a cleared manualFanTs) are dropped by JSON.stringify. */
+    private writeDesired(desired: AquarisDesired): void {
+        try {
+            const tmp: string = `${DESIRED_FILE}.tmp`;
+            fs.writeFileSync(tmp, JSON.stringify(desired));
+            fs.renameSync(tmp, DESIRED_FILE);
+        } catch (_e: unknown) {
+            /* ignore */
+        }
     }
 
     private writeStatus(obj: Record<string, unknown>): void {

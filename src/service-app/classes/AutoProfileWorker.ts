@@ -181,7 +181,10 @@ export class AutoProfileWorker extends DaemonWorker {
         // with it and only switches off below aquarisPcFanMin — but leads the fan's
         // spin-up via a lead floor while `hot`. Not gated by the manual *profile* pause. ----
         const aquaris: AquarisAutoTarget = this.computeAquarisTarget(cfg, signals, hot);
-        this.tccd.dbusData.aquarisAutoTargetJSON = JSON.stringify(aquaris);
+        // Carry resumeAfterSec so the keeper can time-out a manual Aquaris fan
+        // override back to auto-follow in lockstep with the daemon's profile-pause
+        // resume (one resume knob governs both manual overrides).
+        this.tccd.dbusData.aquarisAutoTargetJSON = JSON.stringify({ ...aquaris, resumeAfterSec: cfg.resumeAfterSec });
 
         this.tccd.dbusData.autopilotStatusJSON = JSON.stringify({
             enabled: true,

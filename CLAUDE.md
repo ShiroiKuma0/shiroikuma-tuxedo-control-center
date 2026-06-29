@@ -160,6 +160,17 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
   `TccDBusController` — its `init()` calls `app.exit()`, and `app` is undefined under
   `ELECTRON_RUN_AS_NODE` in the keeper) and overrides the fan fields (LED/pump stay manual). D-Bus
   error ⇒ fall back to the file's fan values.
+- **Manual fan override times out back to auto** (`AquarisLink.tick()` + `tools/tccaquaris`): a manual
+  `tccaquaris on|off|fan` stamps `desired.manualFanTs` (epoch ms) alongside `auto=false`; the keeper
+  re-arms `auto=true` (persisting `desired.json` via `writeDesired`, clearing `manualFanTs`) once
+  `Date.now() - manualFanTs ≥ resumeAfterSec`. `resumeAfterSec` is carried **in the
+  `GetAquarisAutoTargetJSON` payload** (daemon spreads `cfg.resumeAfterSec` into it at
+  `AutoProfileWorker.ts`), so the Aquaris override and the daemon's profile pause share one resume knob
+  (default 300 s); keeper falls back to `DEFAULT_RESUME_SEC` (300) if the field is absent/D-Bus fails,
+  and `resumeAfterSec=0` ⇒ never auto-resume. **Escape hatch:** `tccaquaris auto off` clears
+  `manualFanTs` (no stamp) ⇒ stays manual indefinitely until `auto on`. This is the symmetry 白い熊
+  required — manual fan control is *temporary* like the profile pause, not a one-way latch.
+  (Implemented 2026-06-29.)
 - **Ownership is keeper-authoritative** (`AquarisLink.ts`): the **keeper** heart-beats
   `~/.config/tccaquaris/owner.lock` (`owner='keeper'`) and **never yields**; the **GUI** is a hot
   standby that drives the device only while the keeper's lock is stale/absent (keeper down) plus a

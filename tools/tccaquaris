@@ -12,12 +12,12 @@
 # so it can sit powered for days with the LED dark.
 #
 #   tccaquaris                 show status
-#   tccaquaris on [pct]        cooling on (fan on; optional fan % 1-100)
-#   tccaquaris off             cooling off (fan off)
-#   tccaquaris fan <0-100>     set fan speed (0 = off)
+#   tccaquaris on [pct]        cooling on  (manual; reverts to autopilot after the resume timeout)
+#   tccaquaris off             cooling off (manual; reverts to autopilot after the resume timeout)
+#   tccaquaris fan <0-100>     set fan speed (manual; reverts to autopilot after the resume timeout)
 #   tccaquaris led on|off      LED on (saved colour) / off
 #   tccaquaris led R G B [mode] set LED colour (mode 0=Static 1=Breathe 2=Colorful 3=BreatheColor)
-#   tccaquaris auto on|off     follow the tccd autopilot's fan target (fan only; needs the keeper)
+#   tccaquaris auto on|off     auto on = follow the tccd autopilot now; auto off = stay manual (no timeout)
 #   tccaquaris start           start + enable the keeper (run once; survives logout)
 #   tccaquaris stop|release    stop the keeper (frees the device for the GUI; LED reverts to blue)
 #   tccaquaris restart|svc     restart / show the keeper service
@@ -47,9 +47,9 @@ keeper_active(){ systemctl --user is-active --quiet "$SVC"; }
 modename(){ case "$1" in 0) echo Static;; 1) echo Breathe;; 2) echo Colorful;; 3) echo BreatheColor;; *) echo "mode$1";; esac; }
 
 show(){
-  local fanOn ledOn fan r g b mode conn err auto
+  local fanOn ledOn fan r g b mode conn err auto mts
   fanOn=$(dget '.fanOn'); ledOn=$(dget '.ledOn')
-  fan=$(dget '.fanDutyCycle'); auto=$(dget '.auto')
+  fan=$(dget '.fanDutyCycle'); auto=$(dget '.auto'); mts=$(dget '.manualFanTs')
   r=$(dget '.red'); g=$(dget '.green'); b=$(dget '.blue'); mode=$(dget '.ledMode')
 
   printf '\n  Aquaris  (LCT22002, %s)\n\n' "$MAC"
@@ -75,6 +75,8 @@ show(){
   fi
   if [ "$auto" = "true" ]; then
     printf '  Auto    : following the tccd autopilot fan target (run "tccauto" to see it)\n'
+  elif [ -n "$mts" ] && [ "$mts" != "null" ]; then
+    printf '  Auto    : manual override — reverts to the autopilot after the resume timeout\n'
   fi
   if [ "$ledOn" = "true" ]; then
     printf '  LED     : on   RGB(%s,%s,%s) %s\n' "$r" "$g" "$b" "$(modename "$mode")"
@@ -114,19 +116,21 @@ case "${1:-}" in
     # cooling on (the fan IS the cooling control on the LCT22002; pump does nothing).
     if [ -n "${2:-}" ]; then case "$2" in *[!0-9]*) die "usage: tccaquaris on [0-100]";; esac
       [ "$2" -ge 1 ] && [ "$2" -le 100 ] || die "fan pct must be 1..100"; dset ".fanDutyCycle=$2"; fi
-    dset '.fanOn=true | .pumpOn=false | .auto=false'
-    printf '  cooling ON\n'; note_keeper; show ;;
+    dset ".fanOn=true | .pumpOn=false | .auto=false | .manualFanTs=$(date +%s%3N)"
+    printf '  cooling ON  (manual — reverts to autopilot after the resume timeout)\n'; note_keeper; show ;;
 
   off)
-    dset '.fanOn=false | .pumpOn=false | .auto=false'
-    printf '  cooling off\n'; note_keeper; show ;;
+    dset ".fanOn=false | .pumpOn=false | .auto=false | .manualFanTs=$(date +%s%3N)"
+    printf '  cooling off (manual — reverts to autopilot after the resume timeout)\n'; note_keeper; show ;;
 
   fan)
     n="${2:-}"; case "$n" in ''|*[!0-9]*) die "usage: tccaquaris fan <0-100>";; esac
     [ "$n" -ge 0 ] && [ "$n" -le 100 ] || die "fan must be 0..100"
-    # a manual fan command turns off autopilot follow, so the choice sticks
-    if [ "$n" -eq 0 ]; then dset '.fanOn=false | .auto=false'; else dset ".fanDutyCycle=$n | .fanOn=true | .auto=false"; fi
-    note_keeper; show ;;
+    # A manual fan command pauses autopilot follow; it re-arms after the resume
+    # timeout (the keeper stamps it via manualFanTs). `auto off` makes it permanent.
+    ts=$(date +%s%3N)
+    if [ "$n" -eq 0 ]; then dset ".fanOn=false | .auto=false | .manualFanTs=$ts"; else dset ".fanDutyCycle=$n | .fanOn=true | .auto=false | .manualFanTs=$ts"; fi
+    printf '  fan set (manual — reverts to autopilot after the resume timeout)\n'; note_keeper; show ;;
 
   led)
     case "${2:-}" in
@@ -142,8 +146,8 @@ case "${1:-}" in
 
   auto)
     case "${2:-}" in
-      on)  dset '.auto=true';  printf '  autopilot fan control ON (tccd drives the fan; LED/pump stay manual)\n'; note_keeper; show ;;
-      off) dset '.auto=false'; printf '  autopilot fan control off (manual fan)\n'; note_keeper; show ;;
+      on)  dset '.auto=true | del(.manualFanTs)';  printf '  autopilot fan control ON (tccd drives the fan; LED/pump stay manual)\n'; note_keeper; show ;;
+      off) dset '.auto=false | del(.manualFanTs)'; printf '  autopilot fan control off — staying manual until "auto on"\n'; note_keeper; show ;;
       *) die "usage: tccaquaris auto on|off" ;;
     esac ;;
 
