@@ -4,6 +4,28 @@ Release log for the fork-specific additions on top of
 [tuxedo-control-center](https://github.com/tuxedocomputers/tuxedo-control-center). Upstream's own
 changelog is in [`CHANGELOG.md`](CHANGELOG.md).
 
+## 3.0.6+27 — 2026-06-29
+
+The manual Aquaris fan override now times out back to the autopilot, symmetric with the profile pause.
+
+### Aquaris / keeper — manual fan override auto-resumes
+
+- **A manual fan command is temporary again, not a one-way latch.** `tccaquaris on`, `off` and
+  `fan <pct>` take over the Aquaris fan (setting `auto=false`), but they now stamp the moment they did so,
+  and the keeper **re-arms autopilot fan-follow automatically** once the override has lasted longer than
+  the autopilot's resume timeout. Previously a manual fan command disabled auto-follow *permanently*, so
+  the Aquaris would sit idle under heavy load until an explicit `tccaquaris auto on` — exactly the
+  "laptop fan screaming, Aquaris not turning on" failure this fixes.
+- **One resume clock for both overrides.** The timeout is the same `resumeAfterSec` knob (default 5
+  minutes) that governs the manual *profile* pause, so manual profile picks and manual fan picks now lapse
+  on one consistent clock. The daemon publishes `resumeAfterSec` alongside the Aquaris fan target on D-Bus
+  (`GetAquarisAutoTargetJSON`), so the keeper stays in lockstep with `/etc/tcc/settings`; it falls back to
+  5 minutes if the daemon can't be reached, and `resumeAfterSec = 0` preserves the old "stay manual until
+  re-enabled" behaviour.
+- **Indefinite manual is still available.** `tccaquaris auto off` disables auto-follow *without* a
+  timeout, so you can hold manual control for as long as you like; `tccaquaris auto on` resumes
+  immediately. The `tccaquaris` status line now shows when a manual override is pending its revert.
+
 ## 3.0.6+26 — 2026-06-25
 
 Stability fix for the headless Aquaris keeper.

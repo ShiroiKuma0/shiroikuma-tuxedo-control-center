@@ -10,7 +10,7 @@
 additions: a load-reactive autopilot in the daemon, headless Aquaris water-cooler control over
 Bluetooth, and a full set of D-Bus/SSH command-line tools.**
 
-**📥 Latest release: [`3.0.6+26`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
+**📥 Latest release: [`3.0.6+27`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
 
 </div>
 
@@ -25,7 +25,7 @@ time. It keeps upstream's `tccd` system daemon, the `com.tuxedocomputers.tccd` D
 actions and your `/etc/tcc/` configuration, so everything carries over.
 
 ```bash
-sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+26.deb
+sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+27.deb
 ```
 
 Requires `tuxedo-drivers` (or `tuxedo-keyboard`), like upstream. The binary/command stays
@@ -51,7 +51,9 @@ adds a user-level **keeper** service that holds the BLE link headlessly — keep
 continuously enforcing a desired state — so the Aquaris is controllable **over SSH and the CLI**, and
 driven by the autopilot. Ownership is **keeper-authoritative**: an autostarted tray GUI can never starve
 it and leave the cooler stranded. Under load the autopilot runs the Aquaris fan a step ahead of the
-laptop's own fan (off at rest, ramping as the system heats up, leading at load onset).
+laptop's own fan (off at rest, ramping as the system heats up, leading at load onset). A manual
+`tccaquaris on/off/fan` takes over only temporarily — it lapses back to the autopilot after the same
+resume timeout the profile pause uses, so a one-off fan tweak never leaves the cooler stuck.
 
 ### 🖥️ Headless control over D-Bus — a CLI toolkit
 
