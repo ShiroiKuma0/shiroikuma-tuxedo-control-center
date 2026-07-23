@@ -10,7 +10,7 @@
 additions: a load-reactive autopilot in the daemon, headless Aquaris water-cooler control over
 Bluetooth, and a full set of D-Bus/SSH command-line tools.**
 
-**📥 Latest release: [`3.0.6+27`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
+**📥 Latest release: [`3.0.6+28`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
 
 </div>
 
@@ -25,7 +25,7 @@ time. It keeps upstream's `tccd` system daemon, the `com.tuxedocomputers.tccd` D
 actions and your `/etc/tcc/` configuration, so everything carries over.
 
 ```bash
-sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+27.deb
+sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+28.deb
 ```
 
 Requires `tuxedo-drivers` (or `tuxedo-keyboard`), like upstream. The binary/command stays
@@ -54,6 +54,11 @@ it and leave the cooler stranded. Under load the autopilot runs the Aquaris fan 
 laptop's own fan (off at rest, ramping as the system heats up, leading at load onset). A manual
 `tccaquaris on/off/fan` takes over only temporarily — it lapses back to the autopilot after the same
 resume timeout the profile pause uses, so a one-off fan tweak never leaves the cooler stuck.
+
+And if the Aquaris firmware ever **wedges** — a dropped Bluetooth link can freeze the fan at its last
+speed while the device stops advertising, leaving it blasting and unreachable — the keeper heals that
+too: it detects the signature and **power-cycles the unit through a Tasmota smart plug** on the LAN
+(plug IP from `$KXTCC` / `~/.kxrc`), so a wedge costs minutes of noise instead of days.
 
 ### 🖥️ Headless control over D-Bus — a CLI toolkit
 

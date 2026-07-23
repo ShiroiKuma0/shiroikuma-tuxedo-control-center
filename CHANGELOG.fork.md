@@ -4,6 +4,33 @@ Release log for the fork-specific additions on top of
 [tuxedo-control-center](https://github.com/tuxedocomputers/tuxedo-control-center). Upstream's own
 changelog is in [`CHANGELOG.md`](CHANGELOG.md).
 
+## 3.0.6+28 — 2026-07-23
+
+The keeper now recovers a wedged Aquaris on its own, by power-cycling it through a Tasmota smart plug.
+
+### Aquaris / keeper — firmware-wedge auto-recovery
+
+- **The problem:** a dropped BLE link can wedge the Aquaris firmware — the fan freezes at its last duty
+  while the device stops advertising, so it is unreachable over Bluetooth and can run at full blast for
+  days if nobody is around to pull the plug (exactly what happened on 2026-07-20). The only cure is a
+  power-cycle.
+- **The fix:** the keeper watches for the wedge signature — *"Device not found" for at least 3 minutes
+  straight*, **and** the smart plug reachable and reporting ON, **and** the fan on in the last state it
+  successfully applied (the state a wedge freezes) — and then **power-cycles the unit through a Tasmota
+  smart plug** (Nous A1T) on the LAN: `Power Off`, 5 s, `Power On`. The un-wedged firmware boots with the
+  fan off, the keeper reconnects within seconds, and the autopilot resumes — a wedge now costs a few
+  minutes of noise instead of days.
+- **Deliberately conservative:** at most one power-cycle per 10 minutes; a wedge with the fan *off* is
+  quiet and only logged; an unreachable or switched-off plug never triggers a cycle. If the plug's
+  `Power On` confirmation is ever lost mid-cycle, a standing obligation retries it on every tick and
+  blocks further cycles — the unit can never be left powered off.
+- **Configuration:** the plug's IP is read from the `KXTCC` environment variable, falling back to a live
+  parse of `~/.kxrc` (`export KXTCC=<ip>`) on every check — the keeper runs under `systemd --user`,
+  which doesn't source shell rc files, and the live parse means an IP change applies without a keeper
+  restart. With no `KXTCC` configured anywhere, the keeper behaves exactly as before.
+- Plug wattage (`Status 8`) is logged alongside each wedge check for diagnostics, but no decision rests
+  on it (the A1T's energy metering is uncalibrated out of the box).
+
 ## 3.0.6+27 — 2026-06-29
 
 The manual Aquaris fan override now times out back to the autopilot, symmetric with the profile pause.
