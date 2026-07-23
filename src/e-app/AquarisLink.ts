@@ -43,6 +43,7 @@
  */
 
 import * as fs from 'node:fs';
+import * as http from 'node:http';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import * as dbus from 'dbus-next';
@@ -105,6 +106,26 @@ const STARTUP_GRACE_MS = 6000;
 // resumeAfterSec can't be read over D-Bus (matches defaultAutopilotSettings).
 const DEFAULT_RESUME_SEC = 300;
 
+// ---- Aquaris firmware-wedge recovery via a Tasmota smart plug --------------
+// A dropped BLE link can wedge the Aquaris firmware: the fan freezes at its last
+// duty and the device stops advertising, so it is unreachable over BLE and can
+// run at full blast for days. The only cure is a power-cycle — so the keeper,
+// when it sees the wedge signature (device absent for a sustained period right
+// after the fan was on), power-cycles the unit through a Tasmota plug on the
+// LAN. The plug's IP comes from the KXTCC environment variable, falling back to
+// a live parse of ~/.kxrc (the keeper runs under systemd --user, which does not
+// source shell rc files), so an IP edit there applies without a keeper restart.
+const KXRC_FILE = path.join(os.homedir(), '.kxrc');
+// Sustained "Device not found" before the wedge check may fire. Normal
+// reconnects take seconds; a genuine wedge never comes back on its own.
+const WEDGE_ABSENT_MS = 3 * 60 * 1000;
+// At most one power-cycle per this period, so a device that is genuinely gone
+// (unplugged, out of range) doesn't get its plug toggled forever.
+const WEDGE_COOLDOWN_MS = 10 * 60 * 1000;
+const PLUG_HTTP_TIMEOUT_MS = 5000;
+// How long the plug stays off during a cycle — long enough to drain the unit.
+const PLUG_CYCLE_OFF_MS = 5000;
+
 const DEFAULT_DESIRED: AquarisDesired = {
     red: 0,
     green: 119,
@@ -156,6 +177,16 @@ export class AquarisLink {
     // Autopilot (fork): lazy system-bus link to tccd for the auto fan target.
     private tccBus: dbus.MessageBus | undefined;
     private tccIface: dbus.ClientInterface | undefined;
+
+    // Wedge recovery (fork): when the "Device not found" streak started, whether
+    // the fan was on in the last state we successfully applied (the wedge freezes
+    // the device in that state), when we last power-cycled the plug, and whether
+    // a "Power On" is still owed to the plug after a cycle whose confirmation
+    // failed (never leave the Aquaris powered off).
+    private deviceAbsentSinceMs: number | undefined;
+    private lastAppliedFanOn = false;
+    private lastPlugCycleMs = 0;
+    private plugPendingOn = false;
 
     constructor(
         private readonly role: AquarisRole,
@@ -216,6 +247,9 @@ export class AquarisLink {
                 this.writeStatus({ owner: this.role, connected: false, error: msg });
                 await this.dropIfDisconnected();
                 this.log(`tick error: ${msg}`);
+                if (this.role === 'keeper') {
+                    await this.maybeRecoverWedge(msg);
+                }
             }
             await sleep(POLL_MS);
         }
@@ -266,6 +300,12 @@ export class AquarisLink {
         await this.connect(); // retries internally; throws if device busy/absent (caught by loop)
         await this.applyDesired(desired);
         this.writeStatus({ owner: this.role, device: this.mac, connected: true, applied: desired, error: null });
+        // Wedge-recovery bookkeeping: a successful apply means the device is
+        // reachable (and the plug necessarily on); remember whether the fan is
+        // running — that is the state a wedge would freeze.
+        this.deviceAbsentSinceMs = undefined;
+        this.lastAppliedFanOn = desired.fanOn === true;
+        this.plugPendingOn = false;
     }
 
     // ---- autopilot fan target (from tccd over the system bus) ----------------
@@ -292,6 +332,129 @@ export class AquarisLink {
             this.tccIface = undefined; // force reconnect next time
         }
         return null;
+    }
+
+    // ---- firmware-wedge recovery via the Tasmota plug ------------------------
+    /**
+     * Called on every failed keeper tick. Fires a plug power-cycle when the wedge
+     * signature holds: "Device not found" for WEDGE_ABSENT_MS straight, the plug
+     * reachable and reporting ON, and the fan on in the last applied state (the
+     * state the wedge froze). Deliberately conservative — a wedge with the fan
+     * off is quiet and only logged, and a device that is genuinely unplugged
+     * gets no evidence and no cycling.
+     */
+    private async maybeRecoverWedge(errMsg: string): Promise<void> {
+        // A cycle whose "Power On" confirmation failed leaves an obligation:
+        // retry before anything else, and never cycle again while it is owed.
+        if (this.plugPendingOn) {
+            const pendingIp: string | undefined = this.plugAddress();
+            if (pendingIp !== undefined && (await this.plugPower(pendingIp, 'On')) === 'ON') {
+                this.plugPendingOn = false;
+                this.log('wedge recovery: plug power restored (pending On cleared)');
+            }
+            return;
+        }
+        if (!/device not found/i.test(errMsg)) {
+            return; // other errors neither start nor reset the absence streak
+        }
+        const now: number = Date.now();
+        if (this.deviceAbsentSinceMs === undefined) {
+            this.deviceAbsentSinceMs = now;
+            return;
+        }
+        const absentMs: number = now - this.deviceAbsentSinceMs;
+        if (absentMs < WEDGE_ABSENT_MS || now - this.lastPlugCycleMs < WEDGE_COOLDOWN_MS) {
+            return;
+        }
+        const ip: string | undefined = this.plugAddress();
+        if (ip === undefined) {
+            return; // no plug configured (KXTCC not set anywhere)
+        }
+        const power: string | undefined = await this.plugPower(ip);
+        if (power !== 'ON') {
+            this.log(`wedge check: plug ${ip} ${power === undefined ? 'unreachable' : `reports ${power}`} — not cycling`);
+            return;
+        }
+        // Watts are logged for calibration only — the A1T's metering is not
+        // calibrated, so no decision rests on the absolute value.
+        const watts: number | undefined = await this.plugWatts(ip);
+        this.log(
+            `wedge check: device absent ${Math.round(absentMs / 1000)}s, plug ON` +
+                `${watts !== undefined ? ` (${watts} W)` : ''}, lastAppliedFanOn=${this.lastAppliedFanOn}`,
+        );
+        if (!this.lastAppliedFanOn) {
+            return; // wedged quiet (fan was off) — harmless, leave it to a human
+        }
+        this.lastPlugCycleMs = now;
+        this.plugPendingOn = true; // cleared only once "On" is confirmed
+        this.log(`WEDGE: Aquaris unreachable ${Math.round(absentMs / 1000)}s with fan on — power-cycling plug ${ip}`);
+        await this.plugPower(ip, 'Off');
+        await sleep(PLUG_CYCLE_OFF_MS);
+        if ((await this.plugPower(ip, 'On')) === 'ON') {
+            this.plugPendingOn = false;
+        }
+        // The firmware boots fan-off; give the reboot a fresh absence window.
+        this.lastAppliedFanOn = false;
+        this.deviceAbsentSinceMs = undefined;
+    }
+
+    /** Plug IP: $KXTCC, else a live parse of ~/.kxrc (systemd doesn't source it). */
+    private plugAddress(): string | undefined {
+        const env: string | undefined = process.env.KXTCC;
+        if (env !== undefined && env.trim() !== '') {
+            return env.trim();
+        }
+        try {
+            const m: RegExpMatchArray | null = fs
+                .readFileSync(KXRC_FILE, 'utf8')
+                .match(/^\s*(?:export\s+)?KXTCC=["']?([^"'\s#]+)/m);
+            if (m !== null) {
+                return m[1];
+            }
+        } catch (_e: unknown) {
+            /* no ~/.kxrc */
+        }
+        return undefined;
+    }
+
+    /** Tasmota `Power` state query/set: returns 'ON'/'OFF', undefined on error. */
+    private async plugPower(ip: string, set?: 'On' | 'Off'): Promise<string | undefined> {
+        const resp = await this.plugHttp(ip, set === undefined ? 'Power' : `Power ${set}`);
+        return typeof resp?.POWER === 'string' ? resp.POWER : undefined;
+    }
+
+    /** Tasmota `Status 8` live power draw in watts, undefined on error. */
+    private async plugWatts(ip: string): Promise<number | undefined> {
+        const resp = await this.plugHttp(ip, 'Status 8');
+        const w = resp?.StatusSNS?.ENERGY?.Power;
+        return typeof w === 'number' ? w : undefined;
+    }
+
+    private plugHttp(ip: string, cmnd: string): Promise<any | undefined> {
+        return new Promise((resolve: (v: any | undefined) => void): void => {
+            const req = http.get(
+                `http://${ip}/cm?cmnd=${encodeURIComponent(cmnd)}`,
+                { timeout: PLUG_HTTP_TIMEOUT_MS },
+                (res): void => {
+                    let body: string = '';
+                    res.on('data', (chunk): void => {
+                        body += chunk;
+                    });
+                    res.on('end', (): void => {
+                        try {
+                            resolve(JSON.parse(body));
+                        } catch (_e: unknown) {
+                            resolve(undefined);
+                        }
+                    });
+                },
+            );
+            req.on('timeout', (): void => {
+                req.destroy();
+                resolve(undefined);
+            });
+            req.on('error', (): void => resolve(undefined));
+        });
     }
 
     // ---- ownership lock (keeper-authoritative) ------------------------------

@@ -171,6 +171,19 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
   `manualFanTs` (no stamp) ⇒ stays manual indefinitely until `auto on`. This is the symmetry 白い熊
   required — manual fan control is *temporary* like the profile pause, not a one-way latch.
   (Implemented 2026-06-29.)
+- **Firmware-wedge auto-recovery via Tasmota plug** (`AquarisLink.maybeRecoverWedge()`): a dropped BLE
+  link can wedge the Aquaris firmware — fan frozen at its last duty, device stops advertising,
+  unreachable over BLE, only cured by a power-cycle. The keeper detects the signature ("Device not
+  found" for ≥ 3 min straight **and** the last successfully-applied state had `fanOn=true` **and** the
+  plug is reachable + reports ON) and power-cycles the Aquaris through a **Tasmota smart plug** (Nous
+  A1T) on the LAN: `Power Off` → 5 s → `Power On`, ≥ 10 min cooldown between cycles, and a
+  `plugPendingOn` obligation that keeps retrying `Power On` (and blocks further cycles) if the
+  on-confirmation failed — never leave the unit powered off. Plug IP resolves from **`$KXTCC`**, falling
+  back to a **live parse of `~/.kxrc`** (`export KXTCC=<ip>`) each check — the keeper runs under
+  `systemd --user`, which doesn't source rc files, and a live parse means IP edits apply without a
+  keeper restart. Wedged-with-fan-off is only logged (quiet, left to a human); plug wattage (`Status 8`)
+  is logged but **not** used for decisions — the A1T metering is uncalibrated (reports ~34 V).
+  (Implemented 2026-07-23.)
 - **Ownership is keeper-authoritative** (`AquarisLink.ts`): the **keeper** heart-beats
   `~/.config/tccaquaris/owner.lock` (`owner='keeper'`) and **never yields**; the **GUI** is a hot
   standby that drives the device only while the keeper's lock is stale/absent (keeper down) plus a
