@@ -42,6 +42,7 @@
  * while powered + unconnected; the idle desired state is LED off.
  */
 
+import { execFile } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
 import * as os from 'node:os';
@@ -88,6 +89,14 @@ interface OwnerLock {
     ts: number;
 }
 
+/** What BlueZ says about our own radio — the control for the wedge verdict. */
+interface BleProbe {
+    powered: boolean;
+    discovering: boolean;
+    othersSeen: number;
+    adapterPath: string | undefined;
+}
+
 const NORDIC_UART_SERVICE = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
 const NORDIC_UART_TX = '6e400002-b5a3-f393-e0a9-e50e24dcca9e';
 
@@ -95,6 +104,10 @@ const CFG_DIR: string = path.join(os.homedir(), '.config', 'tccaquaris');
 const DESIRED_FILE: string = path.join(CFG_DIR, 'desired.json');
 const STATUS_FILE: string = path.join(CFG_DIR, 'status.json');
 const LOCK_FILE: string = path.join(CFG_DIR, 'owner.lock');
+// What the keeper must remember across its own restarts. status.json cannot
+// serve: a failed tick rewrites it without the `applied` block, so the last
+// known device state is gone the moment it is needed.
+const KEEPER_STATE_FILE: string = path.join(CFG_DIR, 'keeper-state.json');
 
 const POLL_MS = 1500;
 const STALE_MS = 4000;
@@ -106,25 +119,60 @@ const STARTUP_GRACE_MS = 6000;
 // resumeAfterSec can't be read over D-Bus (matches defaultAutopilotSettings).
 const DEFAULT_RESUME_SEC = 300;
 
-// ---- Aquaris firmware-wedge recovery via a Tasmota smart plug --------------
+// ---- Wedge kill switch via a Tasmota smart plug ----------------------------
 // A dropped BLE link can wedge the Aquaris firmware: the fan freezes at its last
-// duty and the device stops advertising, so it is unreachable over BLE and can
-// run at full blast for days. The only cure is a power-cycle — so the keeper,
-// when it sees the wedge signature (device absent for a sustained period right
-// after the fan was on), power-cycles the unit through a Tasmota plug on the
-// LAN. The plug's IP comes from the KXTCC environment variable, falling back to
+// duty and the device stops advertising, so it is unreachable, uncontrollable,
+// and blows at that duty for as long as it has power. That is what the plug is
+// for — and it is a KILL SWITCH, not a recovery. Cutting and restoring mains
+// does NOT bring the unit back: it powers up only when the button on its front
+// is physically pressed. So the keeper can end a runaway fan but never undo it;
+// restoring the unit is a human job (press the button), and the keeper says so
+// loudly when it cuts power.
+//
+// The power chain is: plug -> laptop's charging brick -> Aquaris -> laptop.
+// Measured 2026-07-26, and it shapes everything here:
+//   - The plug is switched back ON after the cut, and pass-through keeps the
+//     LAPTOP charging even with the Aquaris dead (AC0=1, 46-75 W observed for
+//     minutes with the unit off). So a kill costs no uptime — but the plug must
+//     never be left off, hence the restore obligation.
+//   - Therefore plug WATTAGE SAYS NOTHING about the Aquaris. What it meters is
+//     overwhelmingly the laptop: ~80 W with the unit running is indistinguishable
+//     from 46-75 W with it dead. An earlier draft gated the kill on a calibrated
+//     "is it still drawing power" check; that check was reading the wrong device
+//     and has been removed. Do not reintroduce it.
+//   - A false positive is cheap: if the unit was already off, cutting power to it
+//     changes nothing and the laptop keeps charging. That is why 5 minutes of
+//     silence is enough on its own.
+//   - The BLE adapter is NEVER power-cycled. An earlier draft did that one second
+//     before the cut and the machine hard-killed; the plug cycle itself was then
+//     cleared by test (5x short cuts and a 10 s cut that genuinely killed the
+//     unit, all survived), leaving the adapter reset as the only suspect.
+//
+// The plug's IP comes from the KXTCC environment variable, falling back to
 // a live parse of ~/.kxrc (the keeper runs under systemd --user, which does not
 // source shell rc files), so an IP edit there applies without a keeper restart.
 const KXRC_FILE = path.join(os.homedir(), '.kxrc');
-// Sustained "Device not found" before the wedge check may fire. Normal
-// reconnects take seconds; a genuine wedge never comes back on its own.
-const WEDGE_ABSENT_MS = 3 * 60 * 1000;
-// At most one power-cycle per this period, so a device that is genuinely gone
-// (unplugged, out of range) doesn't get its plug toggled forever.
-const WEDGE_COOLDOWN_MS = 10 * 60 * 1000;
+// Sustained "Device not found" before the wedge verdict may be reached. Short
+// on purpose: the verdict does not rest on waiting, it rests on corroboration
+// (below), so there is nothing to gain by letting a stuck fan run longer.
+const WEDGE_ABSENT_MS = 5 * 60 * 1000;
+// Don't probe or report anything until the outage outlasts an ordinary reconnect.
+const WEDGE_QUIET_MS = 60 * 1000;
+// A BLE scan window long enough for other advertisers in the room to show up.
+const BLE_PROBE_SCAN_MS = 15 * 1000;
+// How long the plug stays off during a kill. Measured 2026-07-26: a 2 s cut is
+// NOT enough — the Aquaris rides it out on its capacitors and reconnects — while
+// 10 s reliably puts it down.
+const PLUG_OFF_HOLD_MS = 10 * 1000;
+// The periodic "still stuck" line is the only trace an outage leaves, but at
+// one per failed tick it buried the journal (~10/min for as long as the outage
+// lasts). Emit it, and repeats of an unchanged tick error, at most this often.
+const WEDGE_LOG_INTERVAL_MS = 60 * 1000;
 const PLUG_HTTP_TIMEOUT_MS = 5000;
-// How long the plug stays off during a cycle — long enough to drain the unit.
-const PLUG_CYCLE_OFF_MS = 5000;
+
+const BLUEZ_BUS_NAME = 'org.bluez';
+const BLUEZ_ADAPTER_IFACE = 'org.bluez.Adapter1';
+const BLUEZ_DEVICE_IFACE = 'org.bluez.Device1';
 
 const DEFAULT_DESIRED: AquarisDesired = {
     red: 0,
@@ -178,15 +226,28 @@ export class AquarisLink {
     private tccBus: dbus.MessageBus | undefined;
     private tccIface: dbus.ClientInterface | undefined;
 
-    // Wedge recovery (fork): when the "Device not found" streak started, whether
-    // the fan was on in the last state we successfully applied (the wedge freezes
-    // the device in that state), when we last power-cycled the plug, and whether
-    // a "Power On" is still owed to the plug after a cycle whose confirmation
-    // failed (never leave the Aquaris powered off).
+    // Wedge detection (fork): when the "Device not found" streak started, what the
+    // device was last known to be doing, and what it draws when healthy. The fan
+    // fields and the baseline are persisted (KEEPER_STATE_FILE) because they can
+    // only be refreshed by a successful apply — an outage that outlives a keeper
+    // restart would otherwise start with no knowledge at all, which is exactly
+    // what happened on 2026-07-26.
     private deviceAbsentSinceMs: number | undefined;
     private lastAppliedFanOn = false;
-    private lastPlugCycleMs = 0;
-    private plugPendingOn = false;
+    private lastAppliedFanDuty = 0;
+    // Set the moment we cut power, cleared only by a successful apply (i.e. the
+    // unit is genuinely back). Without it the kill repeats every WEDGE_ABSENT_MS
+    // forever: the plug feeds the laptop's charging brick, so the draw stays high
+    // after the Aquaris is dead (that draw is the laptop) and the verdict would
+    // otherwise re-fire forever.
+    private killedAtMs: number | undefined;
+    // A restore whose "Power On" confirmation failed leaves an obligation: the
+    // same brick powers the laptop, so the plug must never be left off.
+    private plugRestorePending = false;
+    private lastWedgeLogMs = 0;
+    private lastTickErrorLogMs = 0;
+    private lastTickErrorMsg = '';
+    private bluezBus: dbus.MessageBus | undefined;
 
     constructor(
         private readonly role: AquarisRole,
@@ -205,6 +266,9 @@ export class AquarisLink {
             /* ignore */
         }
         if (this.role === 'keeper') {
+            // Recover what we knew about the device before this process existed —
+            // an outage can easily outlive a keeper restart.
+            this.loadKeeperState();
             // The keeper is the authoritative owner: claim immediately and heart-beat
             // the ownership lock on a steady 1 s timer, decoupled from the (sometimes
             // slow) BLE connect/apply loop — so a slow connect can't let the lock go
@@ -246,9 +310,9 @@ export class AquarisLink {
                 const msg: string = e instanceof Error ? e.message : String(e);
                 this.writeStatus({ owner: this.role, connected: false, error: msg });
                 await this.dropIfDisconnected();
-                this.log(`tick error: ${msg}`);
+                this.logTickError(msg);
                 if (this.role === 'keeper') {
-                    await this.maybeRecoverWedge(msg);
+                    await this.maybeKillWedged(msg);
                 }
             }
             await sleep(POLL_MS);
@@ -300,12 +364,45 @@ export class AquarisLink {
         await this.connect(); // retries internally; throws if device busy/absent (caught by loop)
         await this.applyDesired(desired);
         this.writeStatus({ owner: this.role, device: this.mac, connected: true, applied: desired, error: null });
-        // Wedge-recovery bookkeeping: a successful apply means the device is
-        // reachable (and the plug necessarily on); remember whether the fan is
-        // running — that is the state a wedge would freeze.
+        // Wedge bookkeeping: a successful apply means the device is reachable, so
+        // remember what it is doing — that is the state a wedge would freeze it in,
+        // and all we can report about the fan once it stops answering.
         this.deviceAbsentSinceMs = undefined;
         this.lastAppliedFanOn = desired.fanOn === true;
-        this.plugPendingOn = false;
+        this.lastAppliedFanDuty = desired.fanDutyCycle;
+        // The unit is genuinely back, so a previous kill is spent: re-arm.
+        this.killedAtMs = undefined;
+        if (this.role === 'keeper') {
+            this.saveKeeperState();
+        }
+    }
+
+    // ---- persisted keeper knowledge -----------------------------------------
+    private loadKeeperState(): void {
+        const s = readJson<{ fanOn?: boolean; fanDutyCycle?: number; killedAtMs?: number }>(KEEPER_STATE_FILE);
+        if (s === null) {
+            return;
+        }
+        this.lastAppliedFanOn = s.fanOn === true;
+        this.lastAppliedFanDuty = typeof s.fanDutyCycle === 'number' ? s.fanDutyCycle : 0;
+        // A kill must survive a keeper restart, or the one-shot guard is no guard.
+        this.killedAtMs = typeof s.killedAtMs === 'number' ? s.killedAtMs : undefined;
+    }
+
+    private saveKeeperState(): void {
+        try {
+            fs.writeFileSync(
+                KEEPER_STATE_FILE,
+                JSON.stringify({
+                    fanOn: this.lastAppliedFanOn,
+                    fanDutyCycle: this.lastAppliedFanDuty,
+                    killedAtMs: this.killedAtMs,
+                    ts: Date.now(),
+                }),
+            );
+        } catch (_e: unknown) {
+            /* best effort — the in-memory copy still works for this run */
+        }
     }
 
     // ---- autopilot fan target (from tccd over the system bus) ----------------
@@ -334,23 +431,38 @@ export class AquarisLink {
         return null;
     }
 
-    // ---- firmware-wedge recovery via the Tasmota plug ------------------------
+    // ---- wedge kill switch via the Tasmota plug ------------------------------
     /**
-     * Called on every failed keeper tick. Fires a plug power-cycle when the wedge
-     * signature holds: "Device not found" for WEDGE_ABSENT_MS straight, the plug
-     * reachable and reporting ON, and the fan on in the last applied state (the
-     * state the wedge froze). Deliberately conservative — a wedge with the fan
-     * off is quiet and only logged, and a device that is genuinely unplugged
-     * gets no evidence and no cycling.
+     * Called on every failed keeper tick. Cuts power at the plug when the Aquaris
+     * has answered nothing for WEDGE_ABSENT_MS with reconnects retried throughout.
+     *
+     * Five minutes of silence is enough on its own, because a false positive is
+     * nearly free: the power chain is plug -> brick -> Aquaris -> laptop, and
+     * pass-through keeps the LAPTOP charging even with the Aquaris dead, so
+     * cutting an already-off unit costs nothing. The one case worth holding back
+     * for is our own radio being dead — then the unit may be perfectly healthy and
+     * merely unheard, and killing it would cost 白い熊 a walk to the front button
+     * for nothing. That is all bleRadioUsable() guards.
+     *
+     * Explicitly NOT used as evidence:
+     *   - plug wattage. What the meter sees is overwhelmingly the laptop (~80 W
+     *     running, 46-75 W with the Aquaris dead), so it cannot distinguish the
+     *     two. An earlier draft gated on it; it was reading the wrong device.
+     *   - the fan. Worth 3-6 W against a ±7 W swing — invisible. Reported only.
+     *
+     * The plug is switched back ON after the cut (PLUG_OFF_HOLD_MS off, long
+     * enough that the unit actually powers down rather than riding it out on its
+     * capacitors) so the laptop keeps charging. The Aquaris itself stays dead
+     * until its front button is pressed, which is the whole point.
      */
-    private async maybeRecoverWedge(errMsg: string): Promise<void> {
-        // A cycle whose "Power On" confirmation failed leaves an obligation:
-        // retry before anything else, and never cycle again while it is owed.
-        if (this.plugPendingOn) {
+    private async maybeKillWedged(errMsg: string): Promise<void> {
+        // An unconfirmed restore is an obligation: the laptop is fed through this
+        // plug, so it must never be left switched off.
+        if (this.plugRestorePending) {
             const pendingIp: string | undefined = this.plugAddress();
             if (pendingIp !== undefined && (await this.plugPower(pendingIp, 'On')) === 'ON') {
-                this.plugPendingOn = false;
-                this.log('wedge recovery: plug power restored (pending On cleared)');
+                this.plugRestorePending = false;
+                this.log('plug power restored (pending On cleared)');
             }
             return;
         }
@@ -363,39 +475,222 @@ export class AquarisLink {
             return;
         }
         const absentMs: number = now - this.deviceAbsentSinceMs;
-        if (absentMs < WEDGE_ABSENT_MS || now - this.lastPlugCycleMs < WEDGE_COOLDOWN_MS) {
+        if (absentMs < WEDGE_QUIET_MS) {
+            return; // too soon to call an outage anything
+        }
+        const absentSec: number = Math.round(absentMs / 1000);
+        // One shot. After a kill the unit is dead and stays unreachable, while the
+        // plug's draw stays high (that is the laptop), so without this the verdict
+        // would re-fire every WEDGE_ABSENT_MS forever. Cleared by a successful
+        // apply — i.e. only when the unit is genuinely back.
+        if (this.killedAtMs !== undefined) {
+            this.logWedge(
+                `wedge watch: unreachable ${absentSec}s, already cut ${Math.round((now - this.killedAtMs) / 60000)} min ago — ` +
+                    'waiting for the front button',
+            );
+            return;
+        }
+        if (absentMs < WEDGE_ABSENT_MS) {
+            this.logWedge(
+                `wedge watch: unreachable ${absentSec}s` +
+                    `${this.lastAppliedFanOn ? ` (fan last set to ${this.lastAppliedFanDuty}%)` : ''} — ` +
+                    `verdict in ${Math.round((WEDGE_ABSENT_MS - absentMs) / 1000)}s`,
+            );
             return;
         }
         const ip: string | undefined = this.plugAddress();
         if (ip === undefined) {
-            return; // no plug configured (KXTCC not set anywhere)
+            this.logWedge(`wedge watch: unreachable ${absentSec}s, no plug configured (KXTCC unset)`);
+            return;
         }
         const power: string | undefined = await this.plugPower(ip);
         if (power !== 'ON') {
-            this.log(`wedge check: plug ${ip} ${power === undefined ? 'unreachable' : `reports ${power}`} — not cycling`);
+            // Already dark, or the plug is unreachable — either way, nothing to cut.
+            this.logWedge(`wedge watch: plug ${ip} ${power === undefined ? 'unreachable' : `reports ${power}`}`);
             return;
         }
-        // Watts are logged for calibration only — the A1T's metering is not
-        // calibrated, so no decision rests on the absolute value.
+        if (!(await this.bleRadioUsable())) {
+            this.logWedge(
+                `wedge watch: unreachable ${absentSec}s, but our own Bluetooth is not usable — ` +
+                    'the unit may be fine and simply unheard, so nothing is cut',
+            );
+            return;
+        }
         const watts: number | undefined = await this.plugWatts(ip);
         this.log(
-            `wedge check: device absent ${Math.round(absentMs / 1000)}s, plug ON` +
-                `${watts !== undefined ? ` (${watts} W)` : ''}, lastAppliedFanOn=${this.lastAppliedFanOn}`,
+            `WEDGE: unreachable ${absentSec}s and our radio is up` +
+                `${this.lastAppliedFanOn ? `, fan last set to ${this.lastAppliedFanDuty}%` : ''}` +
+                `${watts !== undefined ? ` (plug ${watts} W — laptop included, not evidence)` : ''} — ` +
+                `cycling plug ${ip} to kill the unit`,
         );
-        if (!this.lastAppliedFanOn) {
-            return; // wedged quiet (fan was off) — harmless, leave it to a human
+        if ((await this.plugPower(ip, 'Off')) !== 'OFF') {
+            this.log(`could not switch plug ${ip} off — will retry on the next tick`);
+            return;
         }
-        this.lastPlugCycleMs = now;
-        this.plugPendingOn = true; // cleared only once "On" is confirmed
-        this.log(`WEDGE: Aquaris unreachable ${Math.round(absentMs / 1000)}s with fan on — power-cycling plug ${ip}`);
-        await this.plugPower(ip, 'Off');
-        await sleep(PLUG_CYCLE_OFF_MS);
-        if ((await this.plugPower(ip, 'On')) === 'ON') {
-            this.plugPendingOn = false;
-        }
-        // The firmware boots fan-off; give the reboot a fresh absence window.
+        this.killedAtMs = now;
         this.lastAppliedFanOn = false;
-        this.deviceAbsentSinceMs = undefined;
+        this.saveKeeperState();
+        // Back on promptly: the laptop is fed through this plug.
+        this.plugRestorePending = true;
+        await sleep(PLUG_OFF_HOLD_MS);
+        if ((await this.plugPower(ip, 'On')) === 'ON') {
+            this.plugRestorePending = false;
+            this.log('plug back on — the laptop keeps charging; the Aquaris stays dead until its button is pressed');
+        } else {
+            this.log(`could not switch plug ${ip} back on — retrying every tick until it takes`);
+        }
+        this.notifyPowerCut(absentSec);
+    }
+
+    /** Desktop notification for the one event that needs 白い熊 to walk over. */
+    private notifyPowerCut(absentSec: number): void {
+        const body: string =
+            `The Aquaris stopped answering for ${Math.round(absentSec / 60)} min` +
+            `${this.lastAppliedFanDuty > 0 ? ` with the fan last set to ${this.lastAppliedFanDuty}%` : ''}, ` +
+            'so its power was cut to stop it. Bluetooth here is working, so the unit is wedged.\n\n' +
+            'The plug is back on and the laptop is still charging — but the Aquaris will NOT restart ' +
+            'until you PRESS THE BUTTON on the front of the unit. There is no cooling until you do.';
+        try {
+            execFile(
+                'notify-send',
+                ['-u', 'critical', '-i', 'dialog-warning', '-a', 'Aquaris keeper', 'Aquaris: power cut', body],
+                (): void => {
+                    /* notify-send may be absent; the log line above is the record that matters */
+                },
+            );
+        } catch (_e: unknown) {
+            /* never let a missing notifier break the keeper */
+        }
+    }
+
+    // ---- is our own Bluetooth the problem? -----------------------------------
+    /**
+     * Ask BlueZ what the radio is actually doing. Returns the number of OTHER
+     * devices currently being seen (BlueZ publishes RSSI only for devices heard
+     * in the running discovery session, so this counts live advertisers, not the
+     * pairing cache) and whether the adapter is powered.
+     *
+     * This is the control for the whole wedge verdict: a radio that is hearing
+     * the room is a radio that would hear the Aquaris if the Aquaris were
+     * talking. Without it, "device not found" is equally consistent with our own
+     * adapter having died, and cutting the unit's power would be blaming the
+     * wrong end.
+     */
+    private async probeBleRadio(): Promise<BleProbe | undefined> {
+        try {
+            if (this.bluezBus === undefined) {
+                this.bluezBus = dbus.systemBus();
+            }
+            const proxy = await this.bluezBus.getProxyObject(BLUEZ_BUS_NAME, '/');
+            const om = proxy.getInterface('org.freedesktop.DBus.ObjectManager');
+            const objects = await om.GetManagedObjects();
+            let powered = false;
+            let discovering = false;
+            let adapterPath: string | undefined;
+            let othersSeen = 0;
+            const self: string = this.mac.toUpperCase();
+            for (const [objPath, ifaces] of Object.entries(objects as Record<string, Record<string, any>>)) {
+                const ad = ifaces[BLUEZ_ADAPTER_IFACE];
+                if (ad !== undefined) {
+                    adapterPath ??= objPath;
+                    powered ||= ad.Powered?.value === true;
+                    discovering ||= ad.Discovering?.value === true;
+                }
+                const dev = ifaces[BLUEZ_DEVICE_IFACE];
+                // BlueZ publishes RSSI only for devices heard in the RUNNING
+                // discovery session and drops it when they go quiet, so this
+                // counts live advertisers rather than the pairing cache.
+                if (dev !== undefined && dev.RSSI !== undefined && String(dev.Address?.value).toUpperCase() !== self) {
+                    othersSeen += 1;
+                }
+            }
+            return { powered, discovering, othersSeen, adapterPath };
+        } catch (_e: unknown) {
+            this.bluezBus = undefined; // force a reconnect next time
+            return undefined;
+        }
+    }
+
+    /**
+     * Make sure a scan is actually running, else nothing ever reports an RSSI.
+     * The DuplicateData filter matters: without it BlueZ does not refresh RSSI on
+     * already-known devices, and the probe sees an empty room that isn't empty.
+     */
+    private async startDiscovery(adapterPath: string): Promise<boolean> {
+        try {
+            if (this.bluezBus === undefined) {
+                this.bluezBus = dbus.systemBus();
+            }
+            const ap = await this.bluezBus.getProxyObject(BLUEZ_BUS_NAME, adapterPath);
+            const iface = ap.getInterface(BLUEZ_ADAPTER_IFACE);
+            try {
+                await iface.SetDiscoveryFilter({
+                    Transport: new dbus.Variant('s', 'le'),
+                    DuplicateData: new dbus.Variant('b', true),
+                });
+            } catch (_e: unknown) {
+                /* filter is an optimisation, not a requirement */
+            }
+            await iface.StartDiscovery();
+            return true;
+        } catch (_e: unknown) {
+            return false; // already discovering (someone else's session) or refused
+        }
+    }
+
+    /**
+     * False only when our own Bluetooth is plainly unusable — BlueZ unreachable,
+     * or no adapter powered. That is the one case where "device not found" says
+     * nothing about the Aquaris, and killing a possibly-healthy unit would cost a
+     * pointless walk to its front button.
+     *
+     * Deliberately NOT requiring that we hear other advertisers. Measured
+     * 2026-07-26, this desk had exactly one other device in range, so a quiet room
+     * would veto the verdict indefinitely. The count is logged as a diagnostic
+     * instead: useful when reading back an outage, but it does not decide.
+     */
+    private async bleRadioUsable(): Promise<boolean> {
+        let probe: BleProbe | undefined = await this.probeBleRadio();
+        if (probe === undefined) {
+            this.logWedge('wedge check: BlueZ unreachable — this end is the suspect, not cutting power');
+            return false;
+        }
+        if (!probe.powered) {
+            this.logWedge('wedge check: no powered Bluetooth adapter — this end is the suspect, not cutting power');
+            return false;
+        }
+        // The keeper stops discovery once connected, so RSSI may be absent purely
+        // because nothing is scanning. Start one so the diagnostic count means
+        // something; the verdict does not depend on the answer.
+        if (!probe.discovering && probe.adapterPath !== undefined) {
+            await this.startDiscovery(probe.adapterPath);
+            await sleep(BLE_PROBE_SCAN_MS);
+            probe = (await this.probeBleRadio()) ?? probe;
+        }
+        this.log(`wedge check: adapter powered, hearing ${probe.othersSeen} other advertiser(s)`);
+        return true;
+    }
+
+
+    /** Rate-limited wedge logging — an outage lasts hours; its log need not. */
+    private logWedge(msg: string): void {
+        const now: number = Date.now();
+        if (now - this.lastWedgeLogMs < WEDGE_LOG_INTERVAL_MS) {
+            return;
+        }
+        this.lastWedgeLogMs = now;
+        this.log(msg);
+    }
+
+    /** Same idea for the per-tick error: say it once, then at most once a minute. */
+    private logTickError(msg: string): void {
+        const now: number = Date.now();
+        if (msg === this.lastTickErrorMsg && now - this.lastTickErrorLogMs < WEDGE_LOG_INTERVAL_MS) {
+            return;
+        }
+        this.lastTickErrorMsg = msg;
+        this.lastTickErrorLogMs = now;
+        this.log(`tick error: ${msg}`);
     }
 
     /** Plug IP: $KXTCC, else a live parse of ~/.kxrc (systemd doesn't source it). */

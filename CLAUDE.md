@@ -171,19 +171,65 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
   `manualFanTs` (no stamp) ⇒ stays manual indefinitely until `auto on`. This is the symmetry 白い熊
   required — manual fan control is *temporary* like the profile pause, not a one-way latch.
   (Implemented 2026-06-29.)
-- **Firmware-wedge auto-recovery via Tasmota plug** (`AquarisLink.maybeRecoverWedge()`): a dropped BLE
+- **Wedge kill switch via Tasmota plug** (`AquarisLink.maybeKillWedged()`): a dropped BLE
   link can wedge the Aquaris firmware — fan frozen at its last duty, device stops advertising,
-  unreachable over BLE, only cured by a power-cycle. The keeper detects the signature ("Device not
-  found" for ≥ 3 min straight **and** the last successfully-applied state had `fanOn=true` **and** the
-  plug is reachable + reports ON) and power-cycles the Aquaris through a **Tasmota smart plug** (Nous
-  A1T) on the LAN: `Power Off` → 5 s → `Power On`, ≥ 10 min cooldown between cycles, and a
-  `plugPendingOn` obligation that keeps retrying `Power On` (and blocks further cycles) if the
-  on-confirmation failed — never leave the unit powered off. Plug IP resolves from **`$KXTCC`**, falling
-  back to a **live parse of `~/.kxrc`** (`export KXTCC=<ip>`) each check — the keeper runs under
-  `systemd --user`, which doesn't source rc files, and a live parse means IP edits apply without a
-  keeper restart. Wedged-with-fan-off is only logged (quiet, left to a human); plug wattage (`Status 8`)
-  is logged but **not** used for decisions — the A1T metering is uncalibrated (reports ~34 V).
-  (Implemented 2026-07-23.)
+  unreachable and uncontrollable, blowing at that duty for as long as it has power. **The plug is a
+  KILL SWITCH, not a recovery.** The Aquaris does **not** come back when mains returns: it powers up
+  only when the **button on its front is physically pressed** (白い熊, 2026-07-26). So the keeper can end
+  a wedge but can never undo it — **a plug cycle is not a recovery and must never be described as one**
+  (that was the 3.0.6+28/+29 premise). The plug *is* switched back on afterwards, but only to keep the
+  **laptop** charging (see the power chain below) — never in the hope of reviving the Aquaris.
+  **Power chain (measured 2026-07-26 — this shapes everything):** plug → laptop's **charging brick** →
+  Aquaris → **laptop**. Consequences:
+  1. **Plug wattage says NOTHING about the Aquaris.** What it meters is overwhelmingly the laptop:
+     ~80 W with the unit running vs **46–75 W with the unit dead** — indistinguishable. An earlier
+     draft gated the kill on a calibrated "still drawing power" check; it was reading the wrong
+     device. **Do not reintroduce it.**
+  2. **Pass-through keeps the laptop charging with the Aquaris dead** (`AC0=1`, verified over minutes).
+     So the plug is switched **back ON** after the cut (`plugRestorePending` retries until confirmed —
+     the laptop is fed through it and it must never be left off), and a kill costs no uptime.
+  3. **A false positive is cheap** — cutting an already-off unit changes nothing. That is why
+     **5 minutes of silence (`WEDGE_ABSENT_MS`) is sufficient evidence on its own.**
+  4. **`PLUG_OFF_HOLD_MS` = 10 s.** A 2 s cut is NOT enough — the Aquaris rides it out on its
+     capacitors and reconnects (measured); 10 s reliably puts it down.
+
+  The only hold-back is **`bleRadioUsable()`**: BlueZ unreachable, or no powered adapter ⇒ the silence
+  says nothing about the Aquaris and a healthy unit would be killed for nothing. It is **read-only** and
+  deliberately does **not** require hearing other advertisers (this desk had exactly one in range — a
+  quiet room must not veto the verdict); the count is logged as a diagnostic only. **The BLE adapter is
+  NEVER power-cycled** — an earlier draft did that one second before the cut and the machine
+  hard-killed, and the plug cycle was subsequently cleared by test (5× short cuts, plus a 10 s cut that
+  genuinely killed the unit — all survived), leaving the adapter reset as the only suspect.
+
+  **`killedAtMs` is a one-shot guard** (persisted): after a kill the unit stays unreachable while the
+  plug's draw stays high, so without it the verdict would re-fire every 5 min forever. Cleared only by a
+  successful apply. Then: a **critical `notify-send`** — the plug is back on and the laptop is charging,
+  but there is **no cooling** until the front button is pressed. `tcc` banners the same thing, read from
+  `keeper-state.json`, since an ON plug otherwise looks perfectly normal.
+
+  Not gated on the fan: it is worth **3–6 W** against a **±7 W** self-swing, so no reading can say
+  whether it spins. Last known fan duty is reported, never relied on. `lastAppliedFanOn`/`fanDuty`/
+  `killedAtMs` persist to **`~/.config/tccaquaris/keeper-state.json`** and reload at keeper start —
+  `status.json` can't serve, because a failed tick rewrites it *without* the `applied` block (which is
+  why it read `applied:null` throughout the 42 h outage). Plug IP from **`$KXTCC`**, falling back to a
+  **live parse of `~/.kxrc`**. Logging rate-limited to 1/min (`WEDGE_LOG_INTERVAL_MS`), for the wedge
+  watch **and** repeats of an unchanged per-tick error — at one per failed tick a 42 h outage wrote
+  ~26 000 journal lines. (2026-07-23 as a power-cycle "recovery"; rebuilt 2026-07-26 as a kill switch,
+  then corrected again once the power chain and the meter's real subject were understood.)
+
+- **A1T metering is CALIBRATED (2026-07-26)** — accurate now, but **still useless as Aquaris evidence**,
+  because what it meters is the laptop (see the power chain above). Done against an **Extol
+  Premium 8831260** wattmeter, chained wall→Extol→A1T→Aquaris, using the live Aquaris as the load (the
+  operating point the detector actually judges) rather than a resistive dummy: `VoltageSet 240.9`,
+  `CurrentSet 489`, `PowerSet 81` ⇒ **`VoltageCal 220→1544`, `PowerCal 12530→10175`,
+  `CurrentCal 3500→3604`**. Before: the plug read **34 V** and over-read power by **20%**; the *current*
+  channel was already correct (0.490 vs 0.489 A), and `PowerCal`/`CurrentCal` were sitting on Tasmota's
+  BL0937 defaults — only `VoltageCal` had been mangled. After: 240.0 V vs 240.9, 78.3 W vs 81.0,
+  0.508 A vs 0.489, cos φ 0.64 vs 0.67 — all inside the meter's own jitter. **Reference numbers for this
+  Aquaris:** running ≈ **78–88 W** (pump; swings ±7 W by itself), fan adds **3–6 W**, unit dead/off =
+  **1.3 W**. Note the plug is a **BL0937** (template `A1T`, `BASE 18`), so Tasmota's defaults are
+  `12530 / 1950 / 3500`. Beware: the readings from *both* meters oscillate ~±7 W on a steady load — that
+  is the dock, not the instruments; a single sample means little, average over ≥15.
 - **Ownership is keeper-authoritative** (`AquarisLink.ts`): the **keeper** heart-beats
   `~/.config/tccaquaris/owner.lock` (`owner='keeper'`) and **never yields**; the **GUI** is a hot
   standby that drives the device only while the keeper's lock is stale/absent (keeper down) plus a
@@ -268,9 +314,20 @@ each other in `resources/tools`.
 
 - `tcc` — interactive 3-column live monitor (dashboard | profiles | Aquaris), 1 s refresh, last
   frame stays on quit. Keys: `q` quit, `1`-`9` / `p` switch profile, `a` Aquaris cooling toggle,
-  `f` fan % (Enter sets), `l` LED toggle. **Aquaris panel reflects the keeper's `status.json`
+  `f` fan % (Enter sets), `l` LED toggle, **`s` wall-plug power on/off** (confirmed when switching
+  **off** — that kills the Aquaris and only its front button revives it; switching **on** reminds you
+  to press that button). **Plug state is polled every 5 s** (`$KXTCC` / `~/.kxrc`, needs `curl`; all
+  plug UI disappears if unset) and shown as a `Plug :` line; when it reads **OFF** the frame carries a
+  full-width reverse-video banner — `⚠ AQUARIS HAS NO POWER` + "switch the plug on, then PRESS THE
+  BUTTON on the unit's front". The banner lives **above** the columns on purpose: `pad` measures with
+  `${#s}`, so ANSI escapes inside a column would wreck the alignment. **Aquaris panel reflects the keeper's `status.json`
   `.applied.*` (what's actually on the device, incl. autopilot-driven), with a `Mode: auto/manual`
   line — not the `desired.json` wish (which is why it used to show "off" while running).**
+  **When the keeper reports no link there is no applied state, so the panel says
+  `Cooling/LED : unknown (no link)` plus a `Wanted :` line for the wish** — it must never print the
+  wish as fact: with `connected:false` it used to claim `Cooling : ON (100%)` while the device had
+  been unreachable for two days (2026-07-26). Only `Mode` still reads from `desired.json` when the
+  link is down (it is our setting, not a device reading).
 - `tccinfo [-m]` — the dashboard readings, one-shot or live (`-m`).
 - `tccprofile [N]` — list profiles / persistently switch (stateMap write via `sudo tccd
   --new_settings` + `SetTempProfileById` push).

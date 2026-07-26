@@ -10,7 +10,15 @@
 #   3. Aquaris state                            — a  toggles cooling on/off
 #                                                 f  edits fan % (Enter applies)
 #                                                 l  toggles the LED
+#                                                 s  switches the wall plug on/off
 #   q quits.
+#
+# The plug (a Tasmota smart switch, IP from $KXTCC or ~/.kxrc) is the last resort
+# for a wedged Aquaris: when it stops answering over BLE the keeper cycles the
+# plug to kill it. The plug goes straight back on — the laptop is charged through
+# the same chain — so a normal-looking ON plug can still mean a dead cooler. The
+# frame banners both cases: plug OFF, and "keeper cut a wedged unit, press its
+# front button", the latter read from keeper-state.json.
 #
 # On terminals narrower than the full 86-column frame (e.g. 58-column SSH
 # sessions) a narrow layout is used automatically: dashboard | profiles side
@@ -39,12 +47,31 @@ SELF_DIR=$(dirname "$(readlink -f "$0")")
 AQ_CFG="$HOME/.config/tccaquaris"
 AQ_DESIRED="$AQ_CFG/desired.json"
 AQ_STATUS="$AQ_CFG/status.json"
+AQ_KEEPER_STATE="$AQ_CFG/keeper-state.json"
 AQ_SVC=tccaquaris-keeper.service
 
 die() { printf 'tcc: %s\n' "$*" >&2; exit 1; }
 command -v busctl >/dev/null || die "busctl not found"
 command -v jq     >/dev/null || die "jq not found"
 [ -t 0 ] && [ -t 1 ] || die "tcc needs an interactive terminal"
+
+# ---- Tasmota plug (optional) -------------------------------------------------
+# Same resolution order as the keeper: $KXTCC, else a KXTCC= line in ~/.kxrc.
+# Absent or curl-less => every plug feature quietly disappears from the UI.
+plug_ip() {
+    local v="${KXTCC-}"
+    if [ -z "$v" ] && [ -r "$HOME/.kxrc" ]; then
+        v=$(sed -n -E 's/^[[:space:]]*(export[[:space:]]+)?KXTCC=(.*)$/\2/p' "$HOME/.kxrc" | head -1)
+        v=${v%%#*}; v=${v//\"/}; v=${v//\'/}
+        v=$(printf '%s' "$v" | tr -d '[:space:]')
+    fi
+    printf '%s' "$v"
+}
+PLUG_IP=''
+command -v curl >/dev/null && PLUG_IP=$(plug_ip)
+PLUG_STATE=''        # ON | OFF | unreachable | '' (no plug)
+PLUG_TS=0            # epoch s of the last poll; 0 forces a refresh
+PLUG_POLL_SEC=5
 
 dj() { busctl --json=short --system call "$BUS" "$OBJ" "$BUS" "$1" 2>/dev/null | jq -r '.data[0] // empty'; }
 j()  { printf '%s' "$2" | jq -r "$1" 2>/dev/null; }
@@ -114,6 +141,19 @@ collect() {
     IGPU_TEMP=$( j '.temp'           "$IGPU")
     IGPU_FREQ=$( j '.coreFrequency'  "$IGPU")
     IGPU_PDRAW=$(j '.powerDraw'      "$IGPU")
+
+    collect_plug
+}
+
+# Polled here (the parent shell) rather than in the renderer, which runs in a
+# command substitution where a cached value could never survive the frame.
+collect_plug() {
+    [ -n "$PLUG_IP" ] || return 0
+    local now; now=$(date +%s)
+    (( now - PLUG_TS < PLUG_POLL_SEC )) && return 0
+    PLUG_TS=$now
+    PLUG_STATE=$(curl -s -m 2 "http://$PLUG_IP/cm?cmnd=Power" 2>/dev/null | jq -r '.POWER // empty' 2>/dev/null)
+    [ -n "$PLUG_STATE" ] || PLUG_STATE='unreachable'
 }
 
 # ---- column renderers (one line per output line) --------------------------------
@@ -153,7 +193,7 @@ render_profiles() {
 }
 
 render_aquaris() {
-    local fanOn ledOn fan r g b link owner conn auto
+    local fanOn ledOn fan r g b link owner conn auto wfan wled
     owner=$(jq -r '.owner // empty'     "$AQ_STATUS" 2>/dev/null)
     conn=$( jq -r '.connected // false' "$AQ_STATUS" 2>/dev/null)
 
@@ -166,29 +206,22 @@ render_aquaris() {
         link='keeper stopped'
     fi
 
-    # Reflect what is ACTUALLY on the device — the keeper's last-applied state
-    # from status.json (this is what tccd's autopilot drives, via the keeper).
-    # Fall back to the desired file only when the keeper isn't connected.
+    # Mode is ours, not the device's, so it is readable either way: from the
+    # keeper's last-applied state when the link is up, from the wish otherwise.
     if [ "$conn" = "true" ]; then
-        fanOn=$(jq -r '.applied.fanOn // false'      "$AQ_STATUS" 2>/dev/null)
-        fan=$(  jq -r '.applied.fanDutyCycle // "?"' "$AQ_STATUS" 2>/dev/null)
-        ledOn=$(jq -r '.applied.ledOn // false'      "$AQ_STATUS" 2>/dev/null)
-        r=$(jq -r '.applied.red // 0'   "$AQ_STATUS" 2>/dev/null)
-        g=$(jq -r '.applied.green // 0' "$AQ_STATUS" 2>/dev/null)
-        b=$(jq -r '.applied.blue // 0'  "$AQ_STATUS" 2>/dev/null)
         auto=$(jq -r '.applied.auto // false' "$AQ_STATUS" 2>/dev/null)
     else
-        fanOn=$(jq -r '.fanOn // false' "$AQ_DESIRED" 2>/dev/null)
-        fan=$(  jq -r '.fanDutyCycle // "?"' "$AQ_DESIRED" 2>/dev/null)
-        ledOn=$(jq -r '.ledOn // false' "$AQ_DESIRED" 2>/dev/null)
-        r=$(jq -r '.red // 0' "$AQ_DESIRED" 2>/dev/null)
-        g=$(jq -r '.green // 0' "$AQ_DESIRED" 2>/dev/null)
-        b=$(jq -r '.blue // 0' "$AQ_DESIRED" 2>/dev/null)
         auto=$(jq -r '.auto // false' "$AQ_DESIRED" 2>/dev/null)
     fi
 
     printf 'Aquaris\n\n'
     printf 'Link    : %s\n' "$link"
+    case "$PLUG_STATE" in
+        ON)  printf 'Plug    : on\n';;
+        OFF) printf 'Plug    : OFF — no power\n';;
+        '')  ;;                                    # no plug configured
+        *)   printf 'Plug    : %s\n' "$PLUG_STATE";;
+    esac
     if [ "$auto" = "true" ]; then
         printf 'Mode    : auto\n'
     else
@@ -198,6 +231,32 @@ render_aquaris() {
         local tw; tw=$(dj GetAquarisAutoTargetJSON 2>/dev/null | jq -r 'if (.enabled and .fanOn) then "auto wants \(.fanDutyCycle)%" else empty end' 2>/dev/null)
         [ -n "$tw" ] && printf '%s\n' "$tw"
     fi
+
+    # No link => the device state is UNKNOWN. desired.json is a wish, not a
+    # reading: printing it as fact once had this panel claiming "Cooling : ON"
+    # while the unit had been unreachable — and, as it turned out, dark — for two
+    # days. Show the wish as a wish, and let the Link line carry the bad news.
+    if [ "$conn" != "true" ]; then
+        fanOn=$(jq -r '.fanOn // false'      "$AQ_DESIRED" 2>/dev/null)
+        fan=$(  jq -r '.fanDutyCycle // "?"' "$AQ_DESIRED" 2>/dev/null)
+        ledOn=$(jq -r '.ledOn // false'      "$AQ_DESIRED" 2>/dev/null)
+        if [ "$fanOn" = "true" ]; then wfan="fan ${fan}%"; else wfan='fan off'; fi
+        if [ "$ledOn" = "true" ]; then wled='LED on';      else wled='LED off'; fi
+        printf 'Cooling : unknown (no link)\n'
+        printf 'LED     : unknown (no link)\n'
+        printf 'Wanted  : %s, %s\n' "$wfan" "$wled"
+        return
+    fi
+
+    # Link is up: reflect what is ACTUALLY on the device — the keeper's
+    # last-applied state (this is what tccd's autopilot drives, via the keeper).
+    fanOn=$(jq -r '.applied.fanOn // false'      "$AQ_STATUS" 2>/dev/null)
+    fan=$(  jq -r '.applied.fanDutyCycle // "?"' "$AQ_STATUS" 2>/dev/null)
+    ledOn=$(jq -r '.applied.ledOn // false'      "$AQ_STATUS" 2>/dev/null)
+    r=$(jq -r '.applied.red // 0'   "$AQ_STATUS" 2>/dev/null)
+    g=$(jq -r '.applied.green // 0' "$AQ_STATUS" 2>/dev/null)
+    b=$(jq -r '.applied.blue // 0'  "$AQ_STATUS" 2>/dev/null)
+
     # Fan % lives on the Cooling line so a stale "last level" never shows when off.
     if [ "$fanOn" = "true" ]; then
         printf 'Cooling : ON  (%s%%)\n' "$fan"
@@ -213,6 +272,32 @@ render_aquaris() {
 
 # ---- frame assembly --------------------------------------------------------------
 fill() { local -n _arr=$1; while (( ${#_arr[@]} < $2 )); do _arr+=(''); done; }
+
+# Two states need shouting about, and neither fits in the 28-column panel, so
+# they go full-width above the columns (where `pad`'s character arithmetic can't
+# be thrown off by escape sequences) in reverse video.
+#
+#   1. The plug is OFF — nothing downstream has power, including the laptop's
+#      charging pass-through.
+#   2. The keeper CUT a wedged Aquaris. The plug is switched back on straight
+#      afterwards (the laptop is fed through it), so the plug reads ON and looks
+#      normal — but the unit is dead until its front button is pressed, and there
+#      is no cooling until then. Only keeper-state.json records this.
+alert_block() {
+    local conn killed
+    if [ "$PLUG_STATE" = "OFF" ]; then
+        printf '  \033[1;97;41m ⚠  AQUARIS HAS NO POWER — the plug is OFF \033[0m\n'
+        printf '     Switch the plug on (s), then\n'
+        printf "     \033[1mPRESS THE BUTTON on the unit's front.\033[0m\n\n"
+        return 0
+    fi
+    conn=$(  jq -r '.connected // false'  "$AQ_STATUS"       2>/dev/null)
+    killed=$(jq -r '.killedAtMs // empty' "$AQ_KEEPER_STATE" 2>/dev/null)
+    [ "$conn" != "true" ] && [ -n "$killed" ] || return 0
+    printf '  \033[1;97;41m ⚠  AQUARIS WAS SHUT DOWN — it had wedged \033[0m\n'
+    printf '     The plug is on and the laptop is charging, but there\n'
+    printf "     is NO COOLING: \033[1mPRESS THE BUTTON on the unit's front.\033[0m\n\n"
+}
 
 profile_digits() {
     local pcount; pcount=$(printf '%s' "$PROFILES" | jq 'length' 2>/dev/null) || pcount=0
@@ -239,13 +324,15 @@ build_frame_narrow() {
     local rows=${#A[@]}; (( ${#B[@]} > rows )) && rows=${#B[@]}
 
     printf '  白い熊 TUXEDO Control Center\n\n'
+    alert_block
     local i
     for (( i = 0; i < rows; i++ )); do
         printf '  %s │ %s\n' "$(pad "${A[i]:-}" "$W1")" "$(pad "${B[i]:-}" "$W2")"
     done
     printf '\n'
     render_aquaris | while IFS= read -r line; do printf '  %s\n' "$line"; done
-    printf '\n  q quit · 1-%s/p profile · a cool · f fan%% · l LED\n' "$(profile_digits)"
+    printf '\n  q quit · 1-%s/p profile · a cool · f fan%% · l LED%s\n' \
+        "$(profile_digits)" "$([ -n "$PLUG_IP" ] && printf ' · s plug')"
 }
 
 build_frame_wide() {
@@ -260,6 +347,7 @@ build_frame_wide() {
     local F1=('q quit')
     local F2=("1-${digits} set profile" 'p switch profile')
     local F3=('a cooling on/off' 'f fan % (Enter sets)' 'l LED on/off')
+    [ -n "$PLUG_IP" ] && F3+=('s plug power on/off')
 
     local rows=$(( ${#A[@]} + 1 + ${#F1[@]} )) n
     n=$(( ${#B[@]} + 1 + ${#F2[@]} )); (( n > rows )) && rows=$n
@@ -269,6 +357,7 @@ build_frame_wide() {
     fill C $(( rows - ${#F3[@]} )); C+=("${F3[@]}")
 
     printf '  白い熊 TUXEDO Control Center\n\n'
+    alert_block
     local i
     for (( i = 0; i < rows; i++ )); do
         printf '  %s │ %s │ %s\n' "$(pad "${A[i]:-}" "$W1")" "$(pad "${B[i]:-}" "$W2")" "$(pad "${C[i]:-}" "$W3")"
@@ -304,7 +393,9 @@ prompt_fan() {
 
 aq_toggle_cooling() {
     # Toggle relative to the ACTUAL running state (a manual toggle takes over
-    # from the autopilot — tccaquaris on/off clears the auto-follow flag).
+    # from the autopilot — tccaquaris on/off clears the auto-follow flag). With
+    # no link there is no actual state, so toggle the wish instead — that is all
+    # a keystroke can do until the device is back, and it is what will be applied.
     local on
     if [ "$(jq -r '.connected // false' "$AQ_STATUS" 2>/dev/null)" = "true" ]; then
         on=$(jq -r '.applied.fanOn // false' "$AQ_STATUS" 2>/dev/null)
@@ -316,6 +407,32 @@ aq_toggle_cooling() {
     else
         "$SELF_DIR/tccaquaris" on >/dev/null 2>&1
     fi
+}
+
+# Plug control. Switching OFF is destructive in a way no other key here is — it
+# kills the Aquaris outright and only a walk to its front button undoes that — so
+# it is confirmed. Switching ON is safe but insufficient, hence the reminder.
+plug_set() {
+    curl -s -m 3 "http://$PLUG_IP/cm?cmnd=Power%20$1" >/dev/null 2>&1
+    PLUG_TS=0   # force a re-poll on the next frame
+}
+
+prompt_plug() {
+    [ -n "$PLUG_IP" ] || return
+    tput cnorm 2>/dev/null
+    local a
+    if [ "$PLUG_STATE" = "ON" ]; then
+        printf '\n  Switch the plug OFF? This cuts power to the Aquaris, and it stays\n'
+        printf '  off until you press the button on its front. [y/N]: '
+        IFS= read -r a
+        case "$a" in y|Y) plug_set Off;; esac
+    else
+        printf '\n  Switching the plug ON. Mains alone will not start the unit —\n'
+        printf '  you must PRESS THE BUTTON on its front. [Enter]'
+        IFS= read -r a
+        plug_set On
+    fi
+    tput civis 2>/dev/null
 }
 
 aq_toggle_led() {
@@ -354,5 +471,6 @@ while :; do
         a|A) aq_toggle_cooling;;
         f|F) prompt_fan;;
         l|L) aq_toggle_led;;
+        s|S) prompt_plug;;
     esac
 done
