@@ -10,7 +10,7 @@
 additions: a load-reactive autopilot in the daemon, headless Aquaris water-cooler control over
 Bluetooth, and a full set of D-Bus/SSH command-line tools.**
 
-**📥 Latest release: [`3.0.6+28`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
+**📥 Latest release: [`3.0.6+34`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
 
 </div>
 
@@ -25,7 +25,7 @@ time. It keeps upstream's `tccd` system daemon, the `com.tuxedocomputers.tccd` D
 actions and your `/etc/tcc/` configuration, so everything carries over.
 
 ```bash
-sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+28.deb
+sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+34.deb
 ```
 
 Requires `tuxedo-drivers` (or `tuxedo-keyboard`), like upstream. The binary/command stays
@@ -55,10 +55,14 @@ laptop's own fan (off at rest, ramping as the system heats up, leading at load o
 `tccaquaris on/off/fan` takes over only temporarily — it lapses back to the autopilot after the same
 resume timeout the profile pause uses, so a one-off fan tweak never leaves the cooler stuck.
 
-And if the Aquaris firmware ever **wedges** — a dropped Bluetooth link can freeze the fan at its last
-speed while the device stops advertising, leaving it blasting and unreachable — the keeper heals that
-too: it detects the signature and **power-cycles the unit through a Tasmota smart plug** on the LAN
-(plug IP from `$KXTCC` / `~/.kxrc`), so a wedge costs minutes of noise instead of days.
+If the Aquaris drops out of sight, the keeper **rescans on its own** every 30 s until it is back, so a
+BlueZ scan that has gone stale can no longer leave a running cooler unreachable for an hour.
+
+And if the Aquaris firmware genuinely **wedges** — a dropped Bluetooth link can freeze the fan at its
+last speed while the device stops advertising, leaving it blasting and unreachable — the keeper ends it:
+after 5 minutes of silence it **cuts power through a Tasmota smart plug** on the LAN (plug IP from
+`$KXTCC` / `~/.kxrc`), switches the plug back on so the laptop keeps charging, and raises a critical
+notification. It is a kill switch, not a cure: the unit comes back only when its front button is pressed.
 
 ### 🖥️ Headless control over D-Bus — a CLI toolkit
 

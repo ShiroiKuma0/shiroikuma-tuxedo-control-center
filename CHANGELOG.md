@@ -1,5 +1,188 @@
 # Changelog
 
+This file carries **both** histories: the 白い熊 TUXEDO Control Center fork's releases first, newest
+first, then upstream [tuxedo-control-center](https://github.com/tuxedocomputers/tuxedo-control-center)'s
+own changelog below, unchanged.
+
+# 白い熊 TUXEDO Control Center fork
+
+## 3.0.6+34 — 2026-10-26
+
+Built on upstream tuxedo-control-center 3.0.6. The keeper now finds an Aquaris that BlueZ has lost sight of, and the wedge handling of +28 is rebuilt as an honest kill switch.
+
+### Aquaris / keeper — rediscover a missing device
+
+- **The problem:** a long-running BLE discovery session can go deaf to a device it has already reported. The controller's duplicate filter suppresses its further advertisements, BlueZ expires the temporary device after 30 s, and from then on the keeper's lookup fails with "Device not found" for as long as the session lives — with the adapter still claiming to scan. On 2026-10-26 the Aquaris sat powered and advertising for an hour like that; a fresh `bluetoothctl scan on` found it within seconds.
+- **The fix:** while the device is missing, the keeper throws away its scan and starts a fresh one with `DuplicateData=true` every 30 s, until the device appears. Logged once per outage. Skipped when BlueZ is unreachable or no adapter is powered; other programs' scan sessions are left alone.
+- **Scan leak closed:** a scan the keeper opened on its own BlueZ D-Bus connection (the wedge probe's) could not be stopped by node-ble, so it kept running under the live link — the time-sharing that destabilises it. Every scan the keeper owns is now stopped the moment it connects.
+
+### Aquaris / keeper — wedge kill switch (replaces the +28 "recovery")
+
+- **A plug cycle does not recover the Aquaris.** After mains returns the unit powers up only when the button on its front is pressed, so the +28 premise was wrong. The plug is now a **kill switch**: it ends a wedged unit blowing at a frozen duty, it does not bring it back.
+- **Verdict:** 5 minutes without hearing the device, held back only when our own Bluetooth is plainly unusable (BlueZ unreachable or no powered adapter). It deliberately does not require hearing other advertisers, so a quiet room cannot veto it. The Bluetooth adapter is never power-cycled.
+- **Action:** cut the plug, hold 10 s (2 s is not enough — the unit rides it out on its capacitors), then switch it back on and keep retrying until confirmed, because the laptop's charging brick is fed through the same plug. One shot per outage (persisted), then a critical desktop notification: no cooling until the front button is pressed.
+- **Plug wattage is no longer used as evidence** — it meters the laptop rather than the cooler. Fan duty is reported, never relied on.
+- **Keeper state survives restarts:** the last applied fan state and the kill marker persist to `~/.config/tccaquaris/keeper-state.json`, since `status.json` drops its `applied` block on every failed tick.
+- **Quieter journal:** the wedge watch and repeated identical tick errors log at most once a minute (a 42 h outage had written ~26 000 lines).
+
+### `tcc` monitor
+
+- **No more fiction when the link is down:** with no link the Aquaris panel shows `unknown (no link)` plus a `Wanted :` line, instead of printing the wish from `desired.json` as fact.
+- **Plug state and control:** a `Plug :` line (polled every 5 s from `$KXTCC` / `~/.kxrc`), `s` to switch the plug on or off (confirmed when switching off), and full-width banners when the plug is off or the keeper has cut a wedged unit — both telling you to press the front button.
+
+## 3.0.6+28 — 2026-07-23
+
+The keeper now recovers a wedged Aquaris on its own, by power-cycling it through a Tasmota smart plug.
+
+### Aquaris / keeper — firmware-wedge auto-recovery
+
+- **The problem:** a dropped BLE link can wedge the Aquaris firmware — the fan freezes at its last duty
+  while the device stops advertising, so it is unreachable over Bluetooth and can run at full blast for
+  days if nobody is around to pull the plug (exactly what happened on 2026-07-20). The only cure is a
+  power-cycle.
+- **The fix:** the keeper watches for the wedge signature — *"Device not found" for at least 3 minutes
+  straight*, **and** the smart plug reachable and reporting ON, **and** the fan on in the last state it
+  successfully applied (the state a wedge freezes) — and then **power-cycles the unit through a Tasmota
+  smart plug** (Nous A1T) on the LAN: `Power Off`, 5 s, `Power On`. The un-wedged firmware boots with the
+  fan off, the keeper reconnects within seconds, and the autopilot resumes — a wedge now costs a few
+  minutes of noise instead of days.
+- **Deliberately conservative:** at most one power-cycle per 10 minutes; a wedge with the fan *off* is
+  quiet and only logged; an unreachable or switched-off plug never triggers a cycle. If the plug's
+  `Power On` confirmation is ever lost mid-cycle, a standing obligation retries it on every tick and
+  blocks further cycles — the unit can never be left powered off.
+- **Configuration:** the plug's IP is read from the `KXTCC` environment variable, falling back to a live
+  parse of `~/.kxrc` (`export KXTCC=<ip>`) on every check — the keeper runs under `systemd --user`,
+  which doesn't source shell rc files, and the live parse means an IP change applies without a keeper
+  restart. With no `KXTCC` configured anywhere, the keeper behaves exactly as before.
+- Plug wattage (`Status 8`) is logged alongside each wedge check for diagnostics, but no decision rests
+  on it (the A1T's energy metering is uncalibrated out of the box).
+
+## 3.0.6+27 — 2026-06-29
+
+The manual Aquaris fan override now times out back to the autopilot, symmetric with the profile pause.
+
+### Aquaris / keeper — manual fan override auto-resumes
+
+- **A manual fan command is temporary again, not a one-way latch.** `tccaquaris on`, `off` and
+  `fan <pct>` take over the Aquaris fan (setting `auto=false`), but they now stamp the moment they did so,
+  and the keeper **re-arms autopilot fan-follow automatically** once the override has lasted longer than
+  the autopilot's resume timeout. Previously a manual fan command disabled auto-follow *permanently*, so
+  the Aquaris would sit idle under heavy load until an explicit `tccaquaris auto on` — exactly the
+  "laptop fan screaming, Aquaris not turning on" failure this fixes.
+- **One resume clock for both overrides.** The timeout is the same `resumeAfterSec` knob (default 5
+  minutes) that governs the manual *profile* pause, so manual profile picks and manual fan picks now lapse
+  on one consistent clock. The daemon publishes `resumeAfterSec` alongside the Aquaris fan target on D-Bus
+  (`GetAquarisAutoTargetJSON`), so the keeper stays in lockstep with `/etc/tcc/settings`; it falls back to
+  5 minutes if the daemon can't be reached, and `resumeAfterSec = 0` preserves the old "stay manual until
+  re-enabled" behaviour.
+- **Indefinite manual is still available.** `tccaquaris auto off` disables auto-follow *without* a
+  timeout, so you can hold manual control for as long as you like; `tccaquaris auto on` resumes
+  immediately. The `tccaquaris` status line now shows when a manual override is pending its revert.
+
+## 3.0.6+26 — 2026-06-25
+
+Stability fix for the headless Aquaris keeper.
+
+### Aquaris / keeper — BLE link stability
+
+- **Stop Bluetooth discovery once connected.** The keeper started scanning to find the device but never
+  stopped, so the adapter kept *actively scanning while holding the connection* — the radio time-shares
+  scan windows with the link, which causes spurious disconnects. A disconnect would then wedge the
+  Aquaris firmware (the fan keeps running while the device stops advertising → unreachable, i.e. "stuck
+  on while reporting off", recoverable only by power-cycling the unit). The keeper now stops discovery
+  the moment it connects and only scans while actively searching for the device.
+- **Rebuild the node-ble stack on a dropped link.** Every reconnect re-fetched the GATT characteristic on
+  the same D-Bus connection, leaking an event listener each time (a `MaxListeners` warning and the keeper
+  growing to minutes of CPU). The keeper now tears the whole node-ble stack down and rebuilds it fresh on
+  a dropped link — once per drop, not per retry, so there is no churn during an outage — which also
+  recovers a wedged Bluetooth adapter.
+
+## 3.0.6+25 — 2026-06-21
+
+First public release of the fork, built on upstream **TUXEDO Control Center 3.0.6**. Everything below is
+added on top of stock TCC.
+
+### Autopilot (load-reactive auto-tuning, in `tccd`)
+
+- New **`AutoProfileWorker`** in the privileged daemon (1 s tick) that automatically switches between a
+  high-load profile and a rest profile based on system load — no second daemon, no GUI required.
+- **Signals:** CPU utilisation (new `/proc/stat` reader), CPU package power (Intel RAPL, as a fraction of
+  the limit), GPU load (Intel/AMD/NVIDIA frequency or power), and CPU/GPU temperatures + the internal fan
+  percentage. It holds sensor-data collection on so RAPL/GPU keep sampling headlessly.
+- **Decision logic:** instant *attack* on the raw signals (switch to the high-load profile the moment
+  real load appears) and a debounced *release* on EMA-smoothed signals, so a single-tick blip — e.g. a
+  dGPU briefly reporting a high clock ratio when it wakes — can't keep it out of rest.
+- **Manual-pick pause:** choosing a profile in the GUI or via `tccprofile` pauses the autopilot so your
+  choice sticks; it resumes after a configurable timeout (default 5 minutes) or immediately via
+  `tccauto on`.
+- **Rest is gated on cool-down:** the profile drops to the rest profile only once load is gone *and* the
+  laptop fan has wound down, so the performance profile holds through the active cool-down.
+- **Tunables** live in `settings.autopilot` (`/etc/tcc/settings`, reloaded on SIGHUP). Defaults are
+  deliberately aggressive; high/rest profiles default to the profiles shown as #1 and #3 by `tccprofile`.
+
+### Aquaris cooling — headless, autopilot-driven
+
+- **Keeper service** (`tccaquaris-keeper`, a per-user systemd unit) that holds the single Bluetooth-LE
+  link to the Aquaris water-cooler and continuously applies a desired state from
+  `~/.config/tccaquaris/desired.json` — so the Aquaris (fan / LED / pump), previously GUI-only, is now
+  controllable headlessly over SSH and the CLI. It keeps the device's LED dark while idle.
+- **Autopilot-driven fan:** the daemon publishes a desired Aquaris fan target on D-Bus and the keeper
+  applies it ("daemon decides, keeper acts", since the root daemon has no Bluetooth). The Aquaris fan
+  **tracks the laptop's own fan** — off at/below 50% PC fan, otherwise running ~10% above it, so it leads
+  the system fan and winds down with it; a **lead floor** brings it on promptly at load onset rather than
+  waiting for the laptop fan to spin up. Auto-follow is on by default.
+- **Keeper-authoritative ownership:** the keeper is the sole authoritative owner of the BLE link and
+  never yields; the GUI is a hot standby that only drives the device when the keeper is absent. This
+  fixes a deadlock where an autostarted tray GUI could grab the link, fail to connect, and leave the
+  cooler uncontrolled with nobody present.
+
+### Headless CLI tools (over D-Bus, packaged into the `.deb`)
+
+- **`tcc`** — interactive 3-column live monitor (dashboard | profiles | Aquaris), 1 s refresh, with keys
+  to switch profiles, toggle Aquaris cooling, set the fan and toggle the LED. Reflects the Aquaris state
+  actually applied on the device, and shows the autopilot's intended fan when in manual mode. A narrow
+  layout kicks in automatically on small/SSH terminals.
+- **`tccinfo`** — the dashboard readings (CPU/GPU temps, fans, power, clocks), one-shot or live (`-m`).
+- **`tccprofile`** — list profiles, or persistently switch the active profile.
+- **`tccaquaris`** — control the Aquaris by editing the desired state the keeper applies (`on`/`off`/
+  `fan`/`led`/`auto on|off`, plus keeper service management).
+- **`tccauto`** — autopilot control (status / `on` / `off` / `high N` / `rest N` / `set KEY VALUE` /
+  `keys`).
+- All five are shipped inside the `.deb` (`extraResources`) and symlinked onto `PATH` at `/usr/bin`.
+
+### Daemon robustness
+
+- **Fixed a D-Bus freeze:** the daemon's `DisplayRefreshRateWorker` ran `w --no-header` *synchronously*
+  on its single event loop every 5 s; under a bloated process table that scan could take 20 s+ and freeze
+  the entire `com.tuxedocomputers.tccd` interface (so GUI/CLI profile switching hung). It now runs `w`
+  asynchronously with a 4 s timeout and an in-flight guard; parsing is unchanged.
+- **Authoritative `--new_settings` reload:** the SIGHUP reload now re-derives the active profile from the
+  freshly-written state map (dropping any stale temporary override), so `tccprofile` switching to a
+  profile the state map already points at applies immediately instead of silently no-op'ing.
+
+### Packaging & identity (replace mode)
+
+- Installs as package **`shiroikuma-tuxedo-control-center`** to `/opt/shiroikuma-tuxedo-control-center`,
+  declaring `Conflicts/Replaces/Provides: tuxedo-control-center` so `apt` supersedes the official package
+  (only one TCC runs). Upstream's `tccd`/`tccd-sleep` daemon, the `com.tuxedocomputers.tccd` D-Bus name,
+  the polkit actions and `/etc/tcc/` are kept as shared singletons.
+- The binary/command stays `tuxedo-control-center`; the Electron runtime identity is pinned to upstream
+  so the single-instance lock and X11 window class stay correct under the renamed package.
+- Versions are stamped `<upstream base>+<N>` (e.g. `3.0.6+25`) so upgrades sort monotonically across
+  upstream bumps. The fork build restores the working tree's version files even if a build is hard-killed
+  mid-package.
+- Fixed the GUI failing to launch under the renamed application id (single-instance lock path).
+
+### Branding & UX
+
+- `白い熊 TUXEDO Control Center` window, tray and launcher labels.
+- Removed the permanent vertical scrollbar on the dashboard at startup, so the dashboard fits the default
+  window cleanly.
+
+# Upstream tuxedo-control-center
+
+# Changelog
+
 ## [3.0.6] - 2026-05-28
 ### Changed
 - Tomte menu not available if version above 3.0.0
