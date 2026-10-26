@@ -160,6 +160,16 @@ const WEDGE_ABSENT_MS = 5 * 60 * 1000;
 const WEDGE_QUIET_MS = 60 * 1000;
 // A BLE scan window long enough for other advertisers in the room to show up.
 const BLE_PROBE_SCAN_MS = 15 * 1000;
+// While the device stays missing, restart our LE scan this often. Diagnosed
+// 2026-10-26: a long-running discovery session can go deaf to a device it has
+// already reported — the controller's duplicate filter suppresses its further
+// advertisements, BlueZ expires the temporary device after TemporaryTimeout
+// (30 s), and from then on getDevice() says "not found" for as long as the
+// session lives, with the adapter still claiming Discovering=yes. The Aquaris
+// was powered and advertising for an hour like that; a fresh `bluetoothctl
+// scan on` found it within seconds. A restarted scan with DuplicateData=true
+// is that same fresh look.
+const SCAN_REFRESH_MS = 30 * 1000;
 // How long the plug stays off during a kill. Measured 2026-07-26: a 2 s cut is
 // NOT enough — the Aquaris rides it out on its capacitors and reconnects — while
 // 10 s reliably puts it down.
@@ -248,6 +258,13 @@ export class AquarisLink {
     private lastTickErrorLogMs = 0;
     private lastTickErrorMsg = '';
     private bluezBus: dbus.MessageBus | undefined;
+    // Missing-device scan refresh (see SCAN_REFRESH_MS): when the last restart
+    // happened, and how many this outage has needed (logged on the first only).
+    private lastScanRefreshMs = 0;
+    private scanRefreshes = 0;
+    // BlueZ discovery sessions belong to the D-Bus connection that opened them,
+    // so a scan started on bluezBus can only be stopped on bluezBus.
+    private bluezBusDiscovering = false;
 
     constructor(
         private readonly role: AquarisRole,
@@ -368,6 +385,7 @@ export class AquarisLink {
         // remember what it is doing — that is the state a wedge would freeze it in,
         // and all we can report about the fan once it stops answering.
         this.deviceAbsentSinceMs = undefined;
+        this.scanRefreshes = 0;
         this.lastAppliedFanOn = desired.fanOn === true;
         this.lastAppliedFanDuty = desired.fanDutyCycle;
         // The unit is genuinely back, so a previous kill is spent: re-arm.
@@ -632,9 +650,66 @@ export class AquarisLink {
                 /* filter is an optimisation, not a requirement */
             }
             await iface.StartDiscovery();
+            this.bluezBusDiscovering = true;
             return true;
         } catch (_e: unknown) {
             return false; // already discovering (someone else's session) or refused
+        }
+    }
+
+    /**
+     * Close the scan session we opened on bluezBus, if any. node-ble's
+     * stopDiscovery() cannot do it — it runs on its own D-Bus connection, and
+     * BlueZ only lets the owning connection stop a session — so without this a
+     * scan started by the wedge probe or a refresh would keep running under the
+     * live link, which is exactly what destabilises it.
+     */
+    private async stopOwnDiscovery(adapterPath?: string): Promise<void> {
+        if (!this.bluezBusDiscovering || this.bluezBus === undefined) {
+            return;
+        }
+        try {
+            const p: string | undefined = adapterPath ?? (await this.probeBleRadio())?.adapterPath;
+            if (p !== undefined) {
+                const ap = await this.bluezBus.getProxyObject(BLUEZ_BUS_NAME, p);
+                await ap.getInterface(BLUEZ_ADAPTER_IFACE).StopDiscovery();
+            }
+        } catch (_e: unknown) {
+            /* session already gone */
+        }
+        this.bluezBusDiscovering = false;
+    }
+
+    /**
+     * The device is still missing: throw away our scan and start a fresh one, so
+     * the controller's duplicate filter and BlueZ's device list are rebuilt from
+     * live advertisements (see SCAN_REFRESH_MS). Rate-limited; a no-op when the
+     * radio itself is unusable. Another program's scan session (KDE, bluetoothctl)
+     * is left alone — our DuplicateData filter is merged into it either way.
+     */
+    private async refreshScanIfDue(): Promise<void> {
+        const now: number = Date.now();
+        if (now - this.lastScanRefreshMs < SCAN_REFRESH_MS) {
+            return;
+        }
+        this.lastScanRefreshMs = now;
+        const probe: BleProbe | undefined = await this.probeBleRadio();
+        if (probe === undefined || !probe.powered || probe.adapterPath === undefined) {
+            return;
+        }
+        try {
+            if (this.adapter !== undefined && (await this.adapter.isDiscovering())) {
+                await this.adapter.stopDiscovery(); // node-ble's session, if it is ours
+            }
+        } catch (_e: unknown) {
+            /* not ours to stop */
+        }
+        await this.stopOwnDiscovery(probe.adapterPath);
+        await sleep(500);
+        const started: boolean = await this.startDiscovery(probe.adapterPath);
+        this.scanRefreshes += 1;
+        if (this.scanRefreshes === 1) {
+            this.log(`device missing — restarted the BLE scan${started ? '' : ' (start refused)'}; repeating every ${SCAN_REFRESH_MS / 1000}s until it appears`);
         }
     }
 
@@ -818,6 +893,7 @@ export class AquarisLink {
                     /* ignore */
                 }
                 if (i === 4) {
+                    await this.refreshScanIfDue();
                     throw e;
                 }
                 await sleep(1000);
@@ -838,6 +914,7 @@ export class AquarisLink {
         } catch (_e: unknown) {
             /* ignore */
         }
+        await this.stopOwnDiscovery();
         const gatt: NodeBle.GattServer = await this.device.gatt();
         const service: NodeBle.GattService = await gatt.getPrimaryService(NORDIC_UART_SERVICE);
         this.uartTx = await service.getCharacteristic(NORDIC_UART_TX);
