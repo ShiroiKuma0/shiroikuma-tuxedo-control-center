@@ -6,6 +6,16 @@ own changelog below, unchanged.
 
 # 白い熊 TUXEDO Control Center fork
 
+## 3.0.6+035 — 2026-10-27
+
+Built on upstream tuxedo-control-center 3.0.6. A packaging-only release: the fork build counter is now zero-padded to three digits. No change to the app, the daemon, the keeper or the CLI tools — the code is identical to +34.
+
+### Packaging & versioning
+
+- **Zero-padded build counter:** fork versions now read `<upstream base>+<NNN>` — `3.0.6+035` rather than `3.0.6+35` — so `.deb` file listings and release tags sort in build order. Every place the version appears carries the padded form: the `.deb` file name, its `Version` field, the version `tccd` reports on D-Bus and the GUI's `app.getVersion()`. They still match exactly, so the GUI's daemon-version check stays quiet.
+- **Upgrades stay monotonic:** dpkg compares digit runs numerically, so `3.0.6+34 < 3.0.6+035`, and `apt` installs this release as an ordinary upgrade over +34. Leading zeros are valid semver build metadata, so electron-builder keeps the string verbatim.
+- Releases up to +34 keep their published unpadded numbers; they are not retagged.
+
 ## 3.0.6+34 — 2026-10-26
 
 Built on upstream tuxedo-control-center 3.0.6. The keeper now finds an Aquaris that BlueZ has lost sight of, and the wedge handling of +28 is rebuilt as an honest kill switch.
