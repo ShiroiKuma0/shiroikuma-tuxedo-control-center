@@ -2,7 +2,7 @@
  * Fork build helper — 白い熊 TUXEDO Control Center.
  *
  * The .deb analogue of the Android forks' `buildFoss` Gradle task:
- *   1. set the fork version `<upstreamVersion>+<N>` into BOTH package.json files,
+ *   1. set the fork version `<upstreamVersion>+<NNN>` (N zero-padded to 3) into BOTH package.json files,
  *   2. production build (app + service + native lib),
  *   3. package the replace-mode .deb,
  *   4. restore the package.json files to the clean upstream version,
@@ -67,7 +67,11 @@ const n = parseInt(fs.readFileSync(buildNumberPath, 'utf8').trim(), 10);
 if (!Number.isInteger(n) || n < 1) {
     throw new Error(`Invalid fork build number in ${buildNumberPath}`);
 }
-const forkVersion = `${baseVersion}+${n}`;
+// Zero-padded to three digits (+001, +035) so artefact listings sort in build order.
+// Safe for both orderings that matter: dpkg compares digit runs numerically (3.0.6+34 <
+// 3.0.6+035), and semver permits leading zeros in build metadata.
+const nPadded = String(n).padStart(3, '0');
+const forkVersion = `${baseVersion}+${nPadded}`;
 
 // Replace only the top-level "version" field (first match), preserving formatting.
 function withVersion(raw: string, version: string): string {
@@ -105,7 +109,7 @@ function run(cmd: string, args: string[], env?: NodeJS.ProcessEnv): void {
     execFileSync(cmd, args, { cwd: repoRoot, stdio: 'inherit', env: { ...process.env, ...env } });
 }
 
-console.log(`\x1b[35mFork build ${forkVersion} (upstream ${baseVersion}, fork #${n})\x1b[0m`);
+console.log(`\x1b[35mFork build ${forkVersion} (upstream ${baseVersion}, fork #${nPadded})\x1b[0m`);
 
 try {
     // 1. Stamp the fork version into both package.json files.
@@ -143,4 +147,4 @@ fs.writeFileSync(buildNumberPath, `${n + 1}\n`);
 
 console.log(`>>> ${dest}`);
 console.log(`>>> deb version ${forkVersion}`);
-console.log(`>>> next fork build number ${n + 1}`);
+console.log(`>>> next fork build number ${String(n + 1).padStart(3, '0')}`);

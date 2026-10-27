@@ -40,7 +40,7 @@ polkit actions, and `/etc/tcc/`. Only one TCC runs at a time.
 | Launcher label | `白い熊 TUXEDO Control Center` | `src/dist-data/*.desktop` `Name=` |
 | Supersede upstream | `Conflicts/Replaces/Provides: tuxedo-control-center` | deb `fpm` in `electron-builder.ts` |
 | `/opt` paths | `…shiroikuma-tuxedo-control-center…` | `TccPaths.ts`, `tccd.service`, `*.desktop`, `after_install.sh` |
-| Fork version stamping | both root + `src/package.json` `version` → `<base>+<N>` at build time, restored after | `build-src/build-fork.ts` |
+| Fork version stamping | both root + `src/package.json` `version` → `<base>+<NNN>` (N zero-padded to 3) at build time, restored after | `build-src/build-fork.ts` |
 | Daemon / D-Bus / config (kept) | `tccd`, `com.tuxedocomputers.tccd`, `/etc/tcc` | unchanged |
 
 The binary/command stays `tuxedo-control-center` (`executableName`) while only `productName` and the
@@ -256,10 +256,14 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
 
 - `version` tracks upstream (currently `3.0.6`), kept clean.
 - `build-src/fork-build-number` (`N`) is our increment, starting at `1`, **reset to 1** on each
-  upstream bump. Fork deb `Version` = `<version>+<N>`; artifact
-  `shiroikuma-tuxedo-control-center_<version>+<N>.deb`, copied to `~/tmp`.
-- Debian sorts `3.0.6 < 3.0.6+1 < 3.0.6+2 < 3.0.7+1`, so upgrades stay monotonic across upstream bumps.
-- `build-fork.ts` stamps `<base>+<N>` into **both** root and `src/package.json` for the build, then
+  upstream bump. The file holds the bare integer; `build-fork.ts` **zero-pads it to three digits**
+  (`NNN`) in the version, so listings sort in build order. Fork deb `Version` = `<version>+<NNN>`;
+  artifact `shiroikuma-tuxedo-control-center_<version>+<NNN>.deb` (e.g. `3.0.6+035`), copied to `~/tmp`.
+  The switch happened at `+035`; builds up to `+34` carry the old unpadded number.
+- Debian compares digit runs numerically, so `3.0.6 < 3.0.6+001 < 3.0.6+34 < 3.0.6+035 < 3.0.7+001` —
+  upgrades stay monotonic across both upstream bumps and the padding switch (semver also allows leading
+  zeros in build metadata, so electron-builder keeps it verbatim).
+- `build-fork.ts` stamps `<base>+<NNN>` into **both** root and `src/package.json` for the build, then
   restores them. This keeps `tccd`'s reported version == `app.getVersion()` == the `.deb` version —
   required, because the GUI's tccd-version-check (`e-app/.../initMain.ts`) restart-loops on a mismatch
   (it re-spawns itself with an extra `--tray` every 5 s). Do **not** reintroduce a version that only

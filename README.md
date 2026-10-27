@@ -91,7 +91,7 @@ onto your `PATH`:
 Renamed package, `/opt` path and `白い熊 TUXEDO Control Center` display name, with the upstream daemon,
 D-Bus name, polkit actions and `/etc/tcc/` kept as shared singletons. The Electron runtime identity is
 pinned to upstream so the single-instance lock and window class stay correct, and the build stamps a
-monotonic `<base>+<N>` version so upgrades sort cleanly across upstream bumps.
+monotonic `<base>+<NNN>` version (build counter zero-padded to three digits) so upgrades sort cleanly across upstream bumps.
 
 ### 🎨 Branding & UX
 

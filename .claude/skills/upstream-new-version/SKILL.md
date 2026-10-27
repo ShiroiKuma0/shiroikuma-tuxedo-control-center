@@ -15,8 +15,8 @@ fresh `+1` build.
 
 - `version` in `package.json`/`src/package.json` **tracks upstream**, left clean.
 - `build-src/fork-build-number` (`N`) is our fork increment; it **resets to 1** on each new upstream
-  version. Fork deb `Version` = `<version>+<N>`; artifact
-  `shiroikuma-tuxedo-control-center_<version>+<N>.deb`.
+  version (the file holds the bare integer). Fork deb `Version` = `<version>+<NNN>` (N zero-padded to
+  three digits); artifact `shiroikuma-tuxedo-control-center_<version>+<NNN>.deb`, e.g. `3.0.7+001`.
 
 ## Steps
 

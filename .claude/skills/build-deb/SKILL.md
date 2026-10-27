@@ -9,8 +9,9 @@ description: Build the 白い熊 TUXEDO Control Center .deb with the pack-fork f
 
 1. **Note the output filename.** Read the version and fork build number:
    - `grep '"version"' package.json | head -1` and `cat build-src/fork-build-number`
-   - The .deb is `shiroikuma-tuxedo-control-center_<version>+<N>.deb`, using the `N`
-     value **before** the build (build-fork bumps it afterward). deb `Version` = `<version>+<N>`.
+   - The .deb is `shiroikuma-tuxedo-control-center_<version>+<NNN>.deb`, using the `N`
+     value **before** the build (build-fork bumps it afterward), zero-padded to three digits
+     (`35` → `+035`). deb `Version` = `<version>+<NNN>`.
 
 2. **Build** (needs Node 24 via fnm — the system node is 18):
    - `export PATH="$HOME/.local/share/fnm:$PATH" && eval "$(fnm env)" && fnm use >/dev/null && npm run pack-fork < /dev/null`

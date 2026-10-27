@@ -24,8 +24,8 @@ this skill is **only** about cutting a GitHub release of a `.deb` those have alr
 
 - Newest fork deb: `ls -t ~/tmp/shiroikuma-tuxedo-control-center_*.deb | head -1`.
 - The **version** is the filename field between the first `_` and `.deb` — e.g.
-  `shiroikuma-tuxedo-control-center_3.0.6+25.deb` → **`3.0.6+25`**. It is `<upstream base>+<fork build
-  N>` (the `+N` tail is set by `build-src/fork-build-number`; see `build-deb`). Use it verbatim
+  `shiroikuma-tuxedo-control-center_3.0.6+035.deb` → **`3.0.6+035`**. It is `<upstream base>+<fork build
+  N, zero-padded to 3>` (the `+NNN` tail is set by `build-src/fork-build-number`; see `build-deb`; builds up to `+34` predate the padding). Use it verbatim
   everywhere (tag, README latest-release line, release title, changelog heading). If there is no `.deb`
   in `~/tmp/`, stop and tell 白い熊 to build first (`build-deb`) — do **not** build it yourself.
 
