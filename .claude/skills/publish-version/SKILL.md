@@ -1,6 +1,6 @@
 ---
 name: publish-version
-description: Publish the latest local .deb build as a GitHub release of this fork — refresh the README (fork-style, major features), write a very specific CHANGELOG entry, tag the bare version, ensure the default branch is `custom`, and create the release with the ~/tmp .deb attached. Use when 白い熊 says publish / release / cut a version / ship it to GitHub.
+description: Publish the latest local .deb build as a GitHub release of this fork — refresh the README (fork-style, major features), write a very specific entry at the top of the unified CHANGELOG.md, tag the bare version, ensure the default branch is `custom`, and create the release with the ~/tmp .deb attached. Use when 白い熊 says publish / release / cut a version / ship it to GitHub.
 ---
 
 # Publish a version of shiroikuma-tuxedo-control-center to GitHub
@@ -91,30 +91,49 @@ sibling **shiroikuma-jami** / **shiroikuma-jiyusagyoban** / **shiroikuma-futokxk
 
 Write real, specific prose — not a bullet dump. Keep it inviting, like the jami / jiyusagyoban READMEs.
 
-## 3. Update `CHANGELOG.fork.md` — exhaustive
+## 3. Update the unified `CHANGELOG.md` — exhaustive
 
-**Use a separate `CHANGELOG.fork.md`, NOT the root `CHANGELOG.md`.** The root `CHANGELOG.md` is
-**upstream's** and is compiled into the app (`build-ng-prod` → `copy-changelog` `cp`s it into
-`src/ng-app/assets/`) and rewritten on every `upstream-new-version` rebase — so the fork's release log
-lives in its own file to avoid clobbering it and to avoid rebase conflicts.
+**One file carries both histories: the root `CHANGELOG.md`** (白い熊's standing rule — never a separate
+fork changelog, never upstream's file overwritten). Its shape:
 
-Create `CHANGELOG.fork.md` on the first publish. Add each new section **above** the previous one:
 ```
-## <version> — <YYYY-MM-DD>
-```
-(use the current date from the environment). **Be very specific — list everything in this release**:
+# Changelog
+<short note: this file carries both histories, fork first, upstream below unchanged>
 
-- **First release:** summarize the whole fork stack — cross-check `git log master..custom --oneline`
-  (commit subjects are self-describing) and group the work into `###` subsections (Autopilot, Aquaris /
-  keeper, CLI tools, Daemon robustness, Packaging & identity, Branding & UX, Fixes). Note the upstream
-  base it's built on (the version minus the `+N` tail, e.g. `3.0.6`).
+# 白い熊 TUXEDO Control Center fork
+
+## <newest version> — <YYYY-MM-DD>
+…
+## <older version> — <YYYY-MM-DD>
+…
+
+# Upstream tuxedo-control-center
+<upstream's own changelog, byte-for-byte>
+```
+
+- **Add the new `## <version> — <YYYY-MM-DD>` section directly under `# 白い熊 TUXEDO Control Center
+  fork`**, above the previous fork release (use the current date from the environment). Say which
+  upstream release it is built on (the version minus the `+NNN` tail, e.g. `3.0.6`).
+- **Our block stays strictly above `# Upstream tuxedo-control-center`.** Upstream adds each new release
+  at the top of *their* text, so keeping ours above it means the two never touch and an
+  `upstream-new-version` rebase merges `CHANGELOG.md` cleanly. On a rebase, keep our block and take
+  upstream's text below it as-is.
+- **Upstream's text is never edited, reordered or reformatted** — the diff must be a pure insertion:
+  `git diff CHANGELOG.md | grep -c '^-[^-]'` → `0`.
+- The file is compiled into the app (`build-ng-prod` → `copy-changelog` `cp`s it into
+  `src/ng-app/assets/`), so the in-app changelog shows our releases first — that is intended.
+
+**Be very specific — list everything in this release** (entries are per-release deltas):
+
 - **Subsequent releases:** the previous fork tag is the latest existing GitHub release
   (`gh release list --repo ShiroiKuma0/shiroikuma-tuxedo-control-center`); list everything since with
-  `git log <lastForkTag>..custom --oneline`, and cross-check the prior `CHANGELOG.fork.md` section so
-  nothing is missed.
+  `git log <lastForkTag>..custom --oneline`, and cross-check the prior fork section so nothing is
+  missed. Group into `###` subsections (Autopilot, Aquaris / keeper, CLI tools, Daemon robustness,
+  Packaging & versioning, Branding & UX, Fixes) as fits.
+- **After an upstream rebase**, the first fork release on the new base says so and summarizes what the
+  rebase carried over.
 
-This file is the authoritative, GitHub-readable fork record. Keep the `build-src/fork-build-number`
-counter bumps out of the prose — they're noise, not features.
+Keep the `build-src/fork-build-number` counter bumps out of the prose — they're noise, not features.
 
 ## 4. Commit, tag, push, release
 
@@ -122,7 +141,7 @@ counter bumps out of the prose — they're noise, not features.
 # .scratch/ is gitignored (scratch-dir-not-tmp). Add it once if missing, and stage it with the docs commit.
 grep -qxF '.scratch/' .gitignore || printf '\n.scratch/\n' >> .gitignore
 
-git add README.md CHANGELOG.fork.md .gitignore
+git add README.md CHANGELOG.md .gitignore
 git commit -F - <<'MSG'
 docs: changelog + README for <version> release
 MSG
@@ -132,12 +151,12 @@ git push origin custom
 git tag -a "<version>" -m "白い熊 TUXEDO Control Center <version>"
 git push origin "<version>"
 
-# Release notes = this version's CHANGELOG.fork.md section. Use a LITERAL match (index($0,h)==1), NOT a
+# Release notes = this version's section of CHANGELOG.md. Use a LITERAL match (index($0,h)==1), NOT a
 # regex: the "+N" tail puts a "+" in the version, and "+" is a regex metachar, so /^## <version>/ would
 # fail to match. index() treats the header as a plain string. The trailing `awk 'NF{f=1} f'` strips the
 # leading blank line(s) after the header so the release body starts on real content.
 mkdir -p .scratch
-awk -v h="## <version>" 'index($0,h)==1{p=1;next} /^## /{if(p)exit} p' CHANGELOG.fork.md \
+awk -v h="## <version>" 'index($0,h)==1{p=1;next} /^##? /{if(p)exit} p' CHANGELOG.md \
   | awk 'NF{f=1} f' > .scratch/release-notes.md
 gh release create "<version>" \
   --repo ShiroiKuma0/shiroikuma-tuxedo-control-center \
@@ -161,5 +180,5 @@ the `.deb`. Report the release URL.
   two never collide.
 - The release is cut from **`custom`**. Don't touch `master` (it only mirrors upstream), and never stage
   build output (`dist/`, `usr/`, `.deb`s) in the docs commit.
-- The fork release log is **`CHANGELOG.fork.md`** — leave the upstream-mirroring root `CHANGELOG.md`
-  (compiled into the app) alone.
+- The fork release log is the **unified root `CHANGELOG.md`** — our block on top, upstream's text below
+  it untouched (pure-insertion diff). Never create a `CHANGELOG.fork.md`.
