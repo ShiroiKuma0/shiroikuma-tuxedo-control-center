@@ -141,13 +141,18 @@ chosen "daemon decides, keeper acts" split it publishes the Aquaris target on D-
   ~10 s for it to ramp; `hot` clears the instant load stops, so the wind-down/off is pure PC-fan curve.
 - **Rest is gated on cool-down, not just idle:** the profile drops to rest only when load is gone
   (`cool`, EMA) **and** the PC fan has wound past `aquarisPcFanMin` (`cooled`) — `restReady = cool &&
-  cooled` — held for `releaseSec`. So profile #1 holds while the laptop is still actively cooling, and
-  #3 engages only after the Aquaris has already switched off.
+  cooled` — held for `releaseSec`. So the high profile holds while the laptop is still actively cooling, and
+  rest engages only after the Aquaris has already switched off.
 - **Settings:** `IAutopilotSettings` + `defaultAutopilotSettings` in `src/common/models/TccSettings.ts`,
   added as optional `autopilot` on `ITccSettings` and to the default-settings objects. The daemon's
   `readOrCreateConfigurationFiles()` forward-fills it (merge defaults); SIGHUP reload picks up edits.
-  Defaults are deliberately aggressive. `highLoadProfileId`/`restProfileId` default empty ⇒ the worker
-  uses profiles #1 and #3 of `GetProfilesJSON` (the order `tccprofile` shows).
+  Defaults are deliberately aggressive. `highLoadProfileId` empty ⇒ profile #1 of `GetProfilesJSON`
+  (the order `tccprofile` shows). `restProfileId` empty ⇒ the **stateMap profile for the current power
+  state** (what runs without the autopilot), never a list position — the old #3 fallback was
+  “Powersave extreme” and pinned all cores at 800 MHz during normal desktop use (2026-11-07).
+- **CPU wake signals:** aggregate `/proc/stat` utilisation (`cpuUtilHigh/Low` 0.1/0.05) **and** the
+  busiest single core (`cpuCoreHigh/Low` 0.75/0.4, `signals.cpuCoreMax`). The 24-core aggregate alone
+  hid interactive / single-threaded work (old 0.3 needed ~7 cores fully busy).
 - **D-Bus** (`TccDBusInterface.ts` + wired via `TccDBusOptions` in `TccDBusService.ts`):
   `GetAutopilotStatusJSON`, `GetAquarisAutoTargetJSON`, `SetAutopilotEnabled(b)`,
   `SetAutopilotSettingsJSON(s)`. Daemon methods `setAutopilotEnabled` / `setAutopilotSettingsJSON` /

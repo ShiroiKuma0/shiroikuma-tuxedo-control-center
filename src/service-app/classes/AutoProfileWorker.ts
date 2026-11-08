@@ -39,6 +39,7 @@
  */
 
 import * as fs from 'node:fs';
+import { determineState } from '../../common/classes/StateUtils';
 import { defaultAutopilotSettings, type IAutopilotSettings } from '../../common/models/TccSettings';
 import { DaemonWorker } from './DaemonWorker';
 import type { TuxedoControlCenterDaemon } from './TuxedoControlCenterDaemon';
@@ -48,8 +49,15 @@ interface CpuStatSample {
     total: number;
 }
 
+/** Aggregate ("cpu") line plus one entry per core ("cpuN"), keyed by core name. */
+interface CpuStatSnapshot {
+    all: CpuStatSample;
+    cores: Map<string, CpuStatSample>;
+}
+
 interface AutopilotSignals {
-    cpuUtil: number; // 0..1
+    cpuUtil: number; // 0..1, aggregate over all cores
+    cpuCoreMax: number; // 0..1, busiest single core
     cpuPowerFrac: number; // 0..1 of RAPL max (0 when unknown)
     gpuLoad: number; // 0..1 (0 when unknown)
     maxTemp: number; // °C, -1 when unknown
@@ -67,13 +75,13 @@ function clamp(n: number, lo: number, hi: number): number {
 }
 
 export class AutoProfileWorker extends DaemonWorker {
-    private prevCpuStat: CpuStatSample | undefined;
+    private prevCpuStat: CpuStatSnapshot | undefined;
     private coolSinceMs: number | undefined;
     private pausedUntilMs: number = 0;
     private lastSeenOverrideTs: number = 0;
     // Exponential moving averages of the release signals — so a single-tick blip
     // (e.g. the dGPU briefly waking, a background task) doesn't reset the release.
-    private ema: { cpuUtil: number; cpuPowerFrac: number; gpuLoad: number } | undefined;
+    private ema: { cpuUtil: number; cpuCoreMax: number; cpuPowerFrac: number; gpuLoad: number } | undefined;
 
     constructor(tccd: TuxedoControlCenterDaemon) {
         super(1000, 'AutoProfileWorker', tccd);
@@ -88,7 +96,10 @@ export class AutoProfileWorker extends DaemonWorker {
     }
 
     public async onWork(): Promise<void> {
-        const cfg: IAutopilotSettings = this.tccd.settings.autopilot ?? defaultAutopilotSettings;
+        // Merge defaults so a key added in a newer build is never undefined, even when
+        // the settings were (re)loaded by a path that skips the forward-fill (an
+        // undefined threshold makes every comparison false — e.g. never `cool`).
+        const cfg: IAutopilotSettings = { ...defaultAutopilotSettings, ...(this.tccd.settings.autopilot ?? {}) };
         const now: number = Date.now();
 
         // Detect external manual profile picks (GUI / tccprofile go through the
@@ -116,9 +127,15 @@ export class AutoProfileWorker extends DaemonWorker {
         // Update smoothed (EMA) release signals.
         const a: number = clamp(cfg.emaAlpha ?? 0.3, 0.01, 1);
         if (this.ema === undefined) {
-            this.ema = { cpuUtil: signals.cpuUtil, cpuPowerFrac: signals.cpuPowerFrac, gpuLoad: signals.gpuLoad };
+            this.ema = {
+                cpuUtil: signals.cpuUtil,
+                cpuCoreMax: signals.cpuCoreMax,
+                cpuPowerFrac: signals.cpuPowerFrac,
+                gpuLoad: signals.gpuLoad,
+            };
         } else {
             this.ema.cpuUtil = a * signals.cpuUtil + (1 - a) * this.ema.cpuUtil;
+            this.ema.cpuCoreMax = a * signals.cpuCoreMax + (1 - a) * this.ema.cpuCoreMax;
             this.ema.cpuPowerFrac = a * signals.cpuPowerFrac + (1 - a) * this.ema.cpuPowerFrac;
             this.ema.gpuLoad = a * signals.gpuLoad + (1 - a) * this.ema.gpuLoad;
         }
@@ -127,12 +144,14 @@ export class AutoProfileWorker extends DaemonWorker {
         // on the SMOOTHED signals (so transient blips can't keep us out of rest). ----
         const hot: boolean =
             signals.cpuUtil >= cfg.cpuUtilHigh ||
+            signals.cpuCoreMax >= cfg.cpuCoreHigh ||
             signals.cpuPowerFrac >= cfg.cpuPowerHigh ||
             signals.gpuLoad >= cfg.gpuLoadHigh ||
             (signals.maxTemp >= 0 && signals.maxTemp >= cfg.tempHigh);
         const cool: boolean =
             !hot &&
             this.ema.cpuUtil < cfg.cpuUtilLow &&
+            this.ema.cpuCoreMax < cfg.cpuCoreLow &&
             this.ema.cpuPowerFrac < cfg.cpuPowerLow &&
             this.ema.gpuLoad < cfg.gpuLoadLow;
         // "Cooled" once the internal (PC) fan has wound down past the Aquaris-off
@@ -160,7 +179,7 @@ export class AutoProfileWorker extends DaemonWorker {
 
         const profiles: Array<{ id: string; name?: string }> = this.readProfiles();
         const highId: string = this.resolveProfileId(cfg.highLoadProfileId, 0, profiles);
-        const restId: string = this.resolveProfileId(cfg.restProfileId, 2, profiles);
+        const restId: string = this.resolveRestProfileId(cfg.restProfileId, profiles);
 
         let targetId: string | undefined;
         if (decision === 'high') {
@@ -214,38 +233,63 @@ export class AutoProfileWorker extends DaemonWorker {
 
     private gatherSignals(): AutopilotSignals {
         return {
-            cpuUtil: this.sampleCpuUtil(),
+            ...this.sampleCpuUtil(),
             cpuPowerFrac: this.readCpuPowerFrac(),
             gpuLoad: this.readGpuLoad(),
             ...this.readTempsAndFan(),
         };
     }
 
-    private readCpuStat(): CpuStatSample | undefined {
+    private static parseCpuLine(line: string): CpuStatSample {
+        const v: number[] = line.trim().split(/\s+/).slice(1).map(Number);
+        const idle: number = (v[3] || 0) + (v[4] || 0); // idle + iowait
+        const total: number = v.reduce((a: number, b: number): number => a + (b || 0), 0);
+        return { busy: total - idle, total };
+    }
+
+    private readCpuStat(): CpuStatSnapshot | undefined {
         try {
-            const line: string = fs.readFileSync('/proc/stat', 'utf8').split('\n', 1)[0];
-            const v: number[] = line.trim().split(/\s+/).slice(1).map(Number);
-            const idle: number = (v[3] || 0) + (v[4] || 0); // idle + iowait
-            const total: number = v.reduce((a: number, b: number): number => a + (b || 0), 0);
-            return { busy: total - idle, total };
+            const lines: string[] = fs.readFileSync('/proc/stat', 'utf8').split('\n');
+            let all: CpuStatSample | undefined;
+            const cores: Map<string, CpuStatSample> = new Map();
+            for (const line of lines) {
+                if (!line.startsWith('cpu')) {
+                    break; // the cpu lines come first
+                }
+                const name: string = line.slice(0, line.indexOf(' '));
+                if (name === 'cpu') {
+                    all = AutoProfileWorker.parseCpuLine(line);
+                } else {
+                    cores.set(name, AutoProfileWorker.parseCpuLine(line));
+                }
+            }
+            return all === undefined ? undefined : { all, cores };
         } catch (_e: unknown) {
             return undefined;
         }
     }
 
-    private sampleCpuUtil(): number {
-        const cur: CpuStatSample | undefined = this.readCpuStat();
-        const prev: CpuStatSample | undefined = this.prevCpuStat;
+    private static util(cur: CpuStatSample, prev: CpuStatSample): number {
+        const dTotal: number = cur.total - prev.total;
+        return dTotal > 0 ? clamp((cur.busy - prev.busy) / dTotal, 0, 1) : 0;
+    }
+
+    /** Aggregate utilisation plus the busiest core's, over the last tick. */
+    private sampleCpuUtil(): { cpuUtil: number; cpuCoreMax: number } {
+        const cur: CpuStatSnapshot | undefined = this.readCpuStat();
+        const prev: CpuStatSnapshot | undefined = this.prevCpuStat;
         this.prevCpuStat = cur;
         if (cur === undefined || prev === undefined) {
-            return 0;
+            return { cpuUtil: 0, cpuCoreMax: 0 };
         }
-        const dTotal: number = cur.total - prev.total;
-        const dBusy: number = cur.busy - prev.busy;
-        if (dTotal <= 0) {
-            return 0;
+        let cpuCoreMax = 0;
+        for (const [name, c] of cur.cores) {
+            const p: CpuStatSample | undefined = prev.cores.get(name);
+            if (p !== undefined) {
+                cpuCoreMax = Math.max(cpuCoreMax, AutoProfileWorker.util(c, p));
+            }
         }
-        return clamp(dBusy / dTotal, 0, 1);
+        return { cpuUtil: AutoProfileWorker.util(cur.all, prev.all), cpuCoreMax };
     }
 
     private readCpuPowerFrac(): number {
@@ -331,6 +375,28 @@ export class AutoProfileWorker extends DaemonWorker {
         } catch (_e: unknown) {
             return [];
         }
+    }
+
+    /**
+     * Rest profile: the configured id if it still exists; otherwise the profile the
+     * stateMap assigns to the current power state — what the machine would run
+     * without the autopilot. Deliberately NOT a list position: the old fallback
+     * (profile #3) was "Powersave extreme", which pinned the CPU at 800 MHz.
+     */
+    private resolveRestProfileId(configured: string, profiles: Array<{ id: string }>): string {
+        if (configured && profiles.some((p): boolean => p.id === configured)) {
+            return configured;
+        }
+        try {
+            const stateId: string | undefined = this.tccd.settings.stateMap?.[determineState().toString()];
+            if (stateId && profiles.some((p): boolean => p.id === stateId)) {
+                return stateId;
+            }
+        } catch (_e: unknown) {
+            /* fall through */
+        }
+        // No usable rest target: return '' so the worker never switches to rest.
+        return '';
     }
 
     /** Configured id if it still exists, else the profile at `fallbackIndex` (then first, then active). */

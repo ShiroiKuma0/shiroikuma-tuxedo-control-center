@@ -71,14 +71,15 @@ show() {
     fi
     printf '  Active  : %s   (decision: %s)\n' "$aname" "$dec"
 
-    local u pw gl mt fan
+    local u co pw gl mt fan
     u=$(printf  '%s' "$s" | jq -r '.signals.cpuUtil // empty')
+    co=$(printf '%s' "$s" | jq -r '.signals.cpuCoreMax // empty')
     pw=$(printf '%s' "$s" | jq -r '.signals.cpuPowerFrac // empty')
     gl=$(printf '%s' "$s" | jq -r '.signals.gpuLoad // empty')
     mt=$(printf '%s' "$s" | jq -r '.signals.maxTemp // empty'); [ "$mt" = "-1" ] && mt="?"
     fan=$(printf '%s' "$s" | jq -r '.signals.internalFan // empty'); [ "$fan" = "-1" ] && fan="?"
-    printf '  Load    : cpu %s  power %s  gpu %s   temp %s°C  fan %s%%\n' \
-        "$(pct "$u")" "$(pct "$pw")" "$(pct "$gl")" "${mt:-?}" "${fan:-?}"
+    printf '  Load    : cpu %s  core %s  power %s  gpu %s   temp %s°C  fan %s%%\n' \
+        "$(pct "$u")" "$(pct "$co")" "$(pct "$pw")" "$(pct "$gl")" "${mt:-?}" "${fan:-?}"
 
     local aen afon afan
     aen=$(printf  '%s' "$s" | jq -r '.aquaris.enabled // false')

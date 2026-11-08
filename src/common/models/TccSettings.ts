@@ -58,11 +58,18 @@ export interface IAutopilotSettings {
     enabled: boolean;
     /** Profile applied under load. Empty => profile #1 in the GetProfilesJSON order. */
     highLoadProfileId: string;
-    /** Profile applied at rest. Empty => profile #3 in the GetProfilesJSON order. */
+    /** Profile applied at rest. Empty => the profile the stateMap assigns to the
+     *  current power state (power_ac / power_bat) — i.e. what you'd get without the
+     *  autopilot. Never falls back to a list position (that once picked
+     *  "Powersave extreme" and pinned the CPU at 800 MHz). */
     restProfileId: string;
-    /** CPU utilisation (0..1, from /proc/stat) thresholds. */
+    /** Aggregate CPU utilisation (0..1, all cores, from /proc/stat) thresholds. */
     cpuUtilHigh: number;
     cpuUtilLow: number;
+    /** Busiest single core (0..1) thresholds — so single-threaded / interactive work
+     *  counts, which the many-core aggregate hides (7 of 24 cores busy = 0.3). */
+    cpuCoreHigh: number;
+    cpuCoreLow: number;
     /** CPU package power as a fraction (0..1) of the RAPL max limit. */
     cpuPowerHigh: number;
     cpuPowerLow: number;
@@ -99,8 +106,10 @@ export const defaultAutopilotSettings: IAutopilotSettings = {
     // (on smoothed signals). Lows sit above typical idle noise — incl. a dGPU that
     // reports ~0.3 clock-ratio when it briefly wakes — so the system reliably
     // settles to rest, while still reacting fast to real load.
-    cpuUtilHigh: 0.3,
-    cpuUtilLow: 0.15,
+    cpuUtilHigh: 0.1,
+    cpuUtilLow: 0.05,
+    cpuCoreHigh: 0.75,
+    cpuCoreLow: 0.4,
     cpuPowerHigh: 0.45,
     cpuPowerLow: 0.25,
     gpuLoadHigh: 0.6,
