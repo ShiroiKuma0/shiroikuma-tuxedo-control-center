@@ -10,7 +10,7 @@
 additions: a load-reactive autopilot in the daemon, headless Aquaris water-cooler control over
 Bluetooth, and a full set of D-Bus/SSH command-line tools.**
 
-**📥 Latest release: [`3.0.6+035`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
+**📥 Latest release: [`3.0.6+040`](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases/latest)** — [all releases & .deb downloads »](https://github.com/ShiroiKuma0/shiroikuma-tuxedo-control-center/releases)
 
 </div>
 
@@ -25,7 +25,7 @@ time. It keeps upstream's `tccd` system daemon, the `com.tuxedocomputers.tccd` D
 actions and your `/etc/tcc/` configuration, so everything carries over.
 
 ```bash
-sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+035.deb
+sudo apt install ./shiroikuma-tuxedo-control-center_3.0.6+040.deb
 ```
 
 Requires `tuxedo-drivers` (or `tuxedo-keyboard`), like upstream. The binary/command stays
@@ -38,9 +38,10 @@ Requires `tuxedo-drivers` (or `tuxedo-keyboard`), like upstream. The binary/comm
 ### 🌡️ Autopilot — load-reactive auto-tuning, built into `tccd`
 
 A new worker inside the privileged daemon watches the signals it already collects — CPU utilisation
-(`/proc/stat`), CPU package power (Intel RAPL), GPU load and temperatures — and **automatically switches
+(`/proc/stat`, both across all cores and on the busiest single core, so interactive work counts), CPU package power (Intel RAPL), GPU load and temperatures — and **automatically switches
 between a high-load profile and a rest profile**. It attacks fast on real load and releases on a
-smoothed average, so a momentary blip can't flip it. A manual profile pick (in the GUI or via
+smoothed average, so a momentary blip can't flip it. Left unconfigured, it rests on the profile you'd
+run without it — never on a crippling powersave profile. A manual profile pick (in the GUI or via
 `tccprofile`) pauses the autopilot so your choice sticks, and it resumes after a few minutes. It's
 aggressive by default, fully tunable from the CLI, and persists across reboots.
 
@@ -85,6 +86,12 @@ onto your `PATH`:
 - **Reliable profile re-apply.** A settings reload now re-derives the active profile from the state map,
   so `tccprofile` switching to an already-mapped profile actually applies instead of silently no-op'ing
   behind a stale temporary override.
+- **A daemon that isn't half asleep.** On Uniwill machines upstream re-writes both fan speeds every
+  second, and each write sleeps ~174 ms inside the firmware — on the daemon's single event loop, so it
+  sat blocked (`D` state) about half the time and answered D-Bus late. The fork writes a fan speed when
+  it actually changes and refreshes it every 10 s (which still corrects the firmware's slow drift), and
+  reads the fan speed every 2 s: blocked time drops from ~52 % to ~19 %, with the fans still exactly on
+  their curve.
 
 ### 📦 Replace-mode packaging & identity
 

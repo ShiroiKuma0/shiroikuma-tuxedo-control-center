@@ -6,6 +6,27 @@ own changelog below, unchanged.
 
 # 白い熊 TUXEDO Control Center fork
 
+## 3.0.6+040 — 2026-11-08
+
+Built on upstream tuxedo-control-center 3.0.6. The autopilot no longer parks a busy desktop at 800 MHz, and `tccd` stops spending half its time asleep in the fan firmware.
+
+### Autopilot — no more 800 MHz desktop
+
+- **The problem:** with no rest profile configured, the autopilot fell back to profile #3 in the list — on a stock profile set that is "Powersave extreme", which caps every core at 800 MHz. And it woke only when aggregate CPU utilisation reached 30 %, which on a 24-core machine needs about 7 cores fully busy. Ordinary desktop work never got there, so the machine sat at 800 MHz while in use and escaped only during heavy bursts — then dropped back 20 s later.
+- **Rest profile fallback:** an empty `restProfileId` now means the profile your state map assigns to the current power source (AC or battery) — what you'd run without the autopilot. It never picks a profile by list position; if that profile is missing too, the autopilot simply doesn't switch to rest.
+- **Busiest-core signal:** a new `cpuCoreMax` signal (`cpuCoreHigh` / `cpuCoreLow`, default 0.75 / 0.4) measures the busiest single core, so single-threaded and interactive work wakes the high-load profile, and rest waits until that core has calmed down.
+- **Lower aggregate thresholds:** `cpuUtilHigh` / `cpuUtilLow` defaults are now 0.1 / 0.05 (were 0.3 / 0.15).
+- **Missing settings can't stall it:** the worker fills in any missing autopilot setting from the defaults on every tick, so a setting added by a newer build is never undefined. An undefined threshold would have made every comparison false, and the autopilot would never have returned to rest.
+- **`tccauto`** shows the busiest-core figure in its Load line (`core NN%`).
+- Settings already stored in `/etc/tcc/settings` are kept; the new keys are added on upgrade.
+
+### Daemon robustness — fan loop no longer blocks `tccd`
+
+- **The problem:** on Uniwill machines upstream re-writes both fan speeds on every 1 s tick, as a workaround for the fan firmware drifting to another speed after hours. Each write calls a firmware (ACPI) routine that pauses inside the kernel for about 174 ms per fan, and each fan-speed read about 51 ms — all on `tccd`'s single event loop. Measured with strace, `tccd` was blocked about 52 % of the time, sat in `D` (uninterruptible sleep) at every sample, and answered D-Bus calls late.
+- **Fan writes:** a fan speed is now written when it changes by 2 points or more, or to or from 0; otherwise it is re-written every 10 s, which still corrects the firmware's drift within 10 s. The curve has one step per °C, so the speed used to flicker by 1 point every other second; upstream's 2 %/s wind-down ramp still writes every second. A profile change still forces a write immediately. Machines that aren't Uniwill keep writing on every change.
+- **Fan-speed reads:** the measured fan speed is only reported (D-Bus, the autopilot, `tcc`), never used for control, so it is now read about every 2 s and the last reading is reported in between. Temperatures are still read every second, because the fan curve needs them.
+- **Measured at steady state:** fan writes per fan fell from 30 to 5 per 30 s, speed reads from 30 to 11, and blocked time from about 52 % to about 19 %. After 9 hours, 90 one-second samples all read exactly the speed the curve calls for.
+
 ## 3.0.6+035 — 2026-10-27
 
 Built on upstream tuxedo-control-center 3.0.6. A packaging-only release: the fork build counter is now zero-padded to three digits. No change to the app, the daemon, the keeper or the CLI tools — the code is identical to +34.
