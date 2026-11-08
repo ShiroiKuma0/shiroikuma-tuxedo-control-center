@@ -45,6 +45,26 @@ export class FanControlWorker extends DaemonWorker {
         tableGPU: [],
     };
     private previousTempValues: Map<number, number> = new Map();
+    // Fork: when each fan speed was last written (ms), for the Uniwill refresh below.
+    private lastFanWriteMs: Map<number, number> = new Map();
+    /**
+     * Fork: Uniwill re-write interval for an UNCHANGED fan speed. Upstream re-writes
+     * every tick (1 s) because the EC drifts to another speed "after one or more
+     * hours" — but each write evaluates an ACPI method that sleeps in-kernel (~174 ms
+     * per fan, measured 2026-11-07), so two fans kept tccd's single event loop in
+     * uninterruptible sleep ~35 % of the time and made D-Bus sluggish. A drift of
+     * hours is fully covered by a periodic refresh; a changed speed is still written
+     * at once — except a 1-point flicker, which the refresh picks up.
+     */
+    private static readonly UNIWILL_REFRESH_MS: number = 10000;
+    /**
+     * Fork: the measured fan speed is only reported (D-Bus / autopilot), never used
+     * for control, yet each read costs ~51 ms of ACPI sleep on the event loop. Read
+     * it every ~2 s instead of every tick and report the cached value in between.
+     * 1900 rather than 2000 so 1 s tick jitter can't stretch it to 3 s.
+     */
+    private static readonly FAN_SPEED_READ_MS: number = 1900;
+    private lastFanSpeedRead: Map<number, { ms: number; speed: number }> = new Map();
     private retryFanInitCounter: number = 5;
     private dbusData: {
         fans: {
@@ -323,12 +343,23 @@ export class FanControlWorker extends DaemonWorker {
         if (!fanLogic) return;
 
         if (this.tccd.settings.fanControlEnabled) {
-            if (
-                (this.isUniwill && calculatedSpeed > -1) ||
-                (this.previousTempValues.get(fanIndex) !== calculatedSpeed && calculatedSpeed > -1)
-            ) {
+            const now: number = Date.now();
+            // A 1-point flicker (temp sitting on a 1 °C table boundary) is left to the
+            // periodic refresh; a step of ≥2 points — incl. upstream's 2 %/s wind-down
+            // ramp — and any move to/from 0 is written at once.
+            const prev: number = this.previousTempValues.get(fanIndex) ?? -1;
+            const changed: boolean =
+                prev === -1 ||
+                Math.abs(calculatedSpeed - prev) >= 2 ||
+                (calculatedSpeed === 0) !== (prev === 0) ||
+                (!this.isUniwill && calculatedSpeed !== prev);
+            const refreshDue: boolean =
+                this.isUniwill &&
+                now - (this.lastFanWriteMs.get(fanIndex) ?? 0) >= FanControlWorker.UNIWILL_REFRESH_MS;
+            if (calculatedSpeed > -1 && (changed || refreshDue)) {
                 await this.fanApi.writeFanSpeed(fanIndex, calculatedSpeed);
                 this.previousTempValues.set(fanIndex, calculatedSpeed);
+                this.lastFanWriteMs.set(fanIndex, now);
             }
         }
     }
@@ -345,7 +376,15 @@ export class FanControlWorker extends DaemonWorker {
             }
 
             if (this.tccd.dbusData.sensorDataCollectionStatus) {
-                const currentSpeedPercent: number = await this.fanApi.getFanSpeedPercent(fanIndex);
+                const now: number = Date.now();
+                const cached: { ms: number; speed: number } | undefined = this.lastFanSpeedRead.get(fanIndex);
+                let currentSpeedPercent: number;
+                if (cached !== undefined && now - cached.ms < FanControlWorker.FAN_SPEED_READ_MS) {
+                    currentSpeedPercent = cached.speed;
+                } else {
+                    currentSpeedPercent = await this.fanApi.getFanSpeedPercent(fanIndex);
+                    this.lastFanSpeedRead.set(fanIndex, { ms: now, speed: currentSpeedPercent });
+                }
 
                 await this.setFanDbusData(fanIndex, temperature, currentSpeedPercent);
             } else {

@@ -111,6 +111,21 @@ low-churn. The display label `白い熊 TUXEDO Control Center` lives only in the
   `SetTempProfileById` push (outside this repo), which becomes a harmless no-op once this ships but
   keeps the wrapper correct against an older `tccd`. (Diagnosed 2026-06-08.)
 
+- **Uniwill fan writes: on change + 10 s refresh, not every tick**
+  (`src/service-app/classes/FanControlWorker.ts`, `writeFanSpeed`): upstream re-writes both fan speeds
+  **every 1 s tick** on Uniwill (its own comment: the EC drifts to another speed "after one or more
+  hours"). Each write goes `tuxedo_io` ioctl → `uw_set_fan` → WMI → an ACPI method that `Sleep()`s
+  in-kernel, ~**174 ms per fan** (fan reads ~51 ms), all on tccd's single event loop — strace measured
+  ~5.2 s of every 10 s blocked, so tccd sat in **D state** at every sample and D-Bus answered late.
+  Fork writes when the computed speed moves by **≥2 points** (or to/from 0), otherwise re-writes every
+  `UNIWILL_REFRESH_MS` (10 s) — an hours-long drift is still corrected within 10 s. The deadband exists
+  because the curve is per-°C and the filtered temp flickers on a boundary (±1 point every other
+  second); upstream's 2 %/s falling ramp still writes every tick. Non-Uniwill keeps exact-change writes.
+  **Fan-speed reads every ~2 s** (`FAN_SPEED_READ_MS` 1900): the measured speed is only *reported*
+  (D-Bus / autopilot), never used for control, and each read is another ~51 ms ACPI sleep — the cached
+  value is reported in between. Temps are still read every tick (the curve needs them). `setPreviousFans()` resetting to −1 still forces a
+  write on profile change. (Diagnosed 2026-11-07.)
+
 ### Autopilot — load-reactive auto profile + Aquaris cooling (preserve on rebase)
 
 A fork feature (no new daemon): a load-reactive "autopilot" lives **inside `tccd`** as a new worker,
